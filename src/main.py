@@ -10,14 +10,13 @@ import warnings
 
 from utils import WeSpeR_LD_minimization
 from autodiff import WeSpeR_LD
-from utils import f_xi, m_idx, WeSpeR_MD_minimization
+from nl_utils import f_xi, m_idx, WeSpeR_MD_minimization
 
 from nl_formulas import nl_cov_shrinkage, nl_prec_shrinkage
 from weighted_LWO_estimator import wLWO_estimator
 
 def WeSpeR_experiment_1(tau_init = None, p = 2000, n = 20000, plots = False):
     LD = True
-    MD = True
 
     c = p/n
     
@@ -124,8 +123,6 @@ def WeSpeR_experiment_1(tau_init = None, p = 2000, n = 20000, plots = False):
             tau_init = tau_init/tau_init.mean()*e_SLWO.mean()
         tau_init_LD = np.sort(np.random.choice(tau_init, p))
         tau_init_LD = torch.tensor(tau_init)
-        tau_init_MD = np.sort(np.random.choice(tau_init, p_tau))
-        tau_init_MD = torch.tensor(tau_init)
     
     # Covariance estimation
     start_time = time.time()
@@ -138,7 +135,6 @@ def WeSpeR_experiment_1(tau_init = None, p = 2000, n = 20000, plots = False):
     loss_S = np.linalg.norm(S - cov, ord = 'fro')**2/p
     loss_SLWO = np.linalg.norm(SLWO - cov, ord = 'fro')**2/p
     loss_Soracle = np.linalg.norm(Soracle - cov, ord = 'fro')**2/p
-    PRIALS_oracle = 1-loss_Soracle/loss_S
     
     # Precision estimation
     prec = np.diag(1/tau_pop)
@@ -148,7 +144,6 @@ def WeSpeR_experiment_1(tau_init = None, p = 2000, n = 20000, plots = False):
     loss_P = np.linalg.norm(np.linalg.pinv(S) - prec, ord = 'fro')**2/p
     loss_PLWO = np.linalg.norm(np.linalg.pinv(SLWO) - prec, ord = 'fro')**2/p
     loss_Poracle = np.linalg.norm(Poracle - prec, ord = 'fro')**2/p
-    PRIALP_oracle = 1-loss_Poracle/loss_P
     
     # Optimize tau
     if LD:
@@ -166,42 +161,22 @@ def WeSpeR_experiment_1(tau_init = None, p = 2000, n = 20000, plots = False):
     else:
         estimator_LD = None
 
-    if MD:
-        print("WeSpeR_MD:", MD) 
-        start_time = time.time()
-        estimator_MD = WeSpeR_MD(bias=True, assume_centered=True).fit_from_F(torch.tensor(lambda_), U, W, tau_init = tau_init_MD, wt = None, d = d, wd = wd, c = c, mu = mu, weights = weights, w_args = w_args, omega = omega, lr = lr, n_epochs = n_epochs_MD, loss_type = loss_type, method = method, verbose = verbose)
-        last_time = time.time()
-        print("Compute time:", last_time - start_time, "s.")
-
-        Snl = estimator_MD.get_covariance(d = d, wd = wd, weights = weights, w_args = w_args, method = 'root', verbose = False)
-        loss_Snlq = np.linalg.norm(Snl -  np.diag(tau_pop), ord = 'fro')**2/p
-        Pnl = estimator_MD.get_precision(d = d, wd = wd, weights = weights, w_args = w_args, method = 'root', verbose = False)
-        loss_Pnlq = np.linalg.norm(Pnl -  np.diag(1/tau_pop), ord = 'fro')**2/p
-        tau_fit_MD = estimator_MD.get_tau()
-    else:
-        estimator_MD = None
-    
+    print("Covariance matrix estimation:")
     print("Norm cov:       \t", np.around(norm_cov,3))
     print("Loss/PRIAL S:   \t", np.around(loss_S,3), "\t|\t", 0)
-    print("Loss/PRIAL SLWO:\t", np.around(loss_SLWO,3), "\t|\t", np.around(1-loss_SLWO/loss_S,3))
-    if LD:
-        print("Loss/PRIAL SLD: \t", np.around(loss_Snlb,3), "\t|\t", np.around(1-loss_Snlb/loss_S,3))
-    if MD:
-        print("Loss/PRIAL SMD: \t", np.around(loss_Snlq,3), "\t|\t", np.around(1-loss_Snlq/loss_S,3))
-    print("Loss/PRIAL Sor: \t", np.around(loss_Soracle,3), "\t|\t", np.around(1-loss_Soracle/loss_S,3))
+    print("Loss/PRIAL linear shrinkage:\t", np.around(loss_SLWO,3), "\t|\t", np.around(1-loss_SLWO/loss_S,3))
+    print("Loss/PRIAL autodiff non-linear: \t", np.around(loss_Snlb,3), "\t|\t", np.around(1-loss_Snlb/loss_S,3))
+    print("Loss/PRIAL oracle non-linear: \t", np.around(loss_Soracle,3), "\t|\t", np.around(1-loss_Soracle/loss_S,3))
     print()
-    
+
+    print("Precision matrix estimation:")
     print("Norm prec:      \t", np.around(norm_prec,3))
     print("Loss/PRIAL P:   \t", np.around(loss_P,3), "\t|\t", 0)
-    print("Loss/PRIAL PLWO:\t", np.around(loss_PLWO,3), "\t|\t", np.around(1-loss_PLWO/loss_P,5))
-    if LD:
-        print("Loss/PRIAL PLD: \t", np.around(loss_Pnlb,3), "\t|\t", np.around(1-loss_Pnlb/loss_P,3))
-    if MD:
-        print("Loss/PRIAL PMD: \t", np.around(loss_Pnlq,3), "\t|\t", np.around(1-loss_Pnlq/loss_P,3))
-    print("Loss/PRIAL Por: \t", np.around(loss_Poracle,3), "\t|\t", np.around(1-loss_Poracle/loss_P,5))
+    print("Loss/PRIAL linear shrinkage:\t", np.around(loss_PLWO,3), "\t|\t", np.around(1-loss_PLWO/loss_P,5))
+    print("Loss/PRIAL autodiff non-linear: \t", np.around(loss_Pnlb,3), "\t|\t", np.around(1-loss_Pnlb/loss_P,3))
+    print("Loss/PRIAL oracle non-linear: \t", np.around(loss_Poracle,3), "\t|\t", np.around(1-loss_Poracle/loss_P,5))
     
     if plots:
-        if LD:
             # Plot the results        
             Fx = f_xi.apply
             output = Fx(tau_fit_LD, None, d, wd, c, mu, weights, w_args, omega, method, False) 
@@ -243,50 +218,8 @@ def WeSpeR_experiment_1(tau_init = None, p = 2000, n = 20000, plots = False):
             plt.title("c="+str(c)+", "+weights+", alpha="+str(w_args[0])+", omega="+str(omega))
             plt.legend()
             plt.show()    
-        if MD:
-            # Plot the results        
-            Fx = f_xi.apply
-            output = Fx(tau_fit_MD, None, d, wd, c, mu, weights, w_args, omega, method, False) 
-            nu = output[-1].to(int)
-            omegai = output[-nu-1:-1].to(int)
-            output = output[:-nu-1]
-            f = output[:output.shape[0]//3]
-            F = output[output.shape[0]//3:2*output.shape[0]//3]
-            xi = output[2*output.shape[0]//3:]
-            plt.figure()
-            plt.plot(xi.detach().numpy(), f.detach().numpy(), label="(MD) Asymptotic sample density")
-            plt.hist(lambda_, bins=100, density=True, label="Sample density")
-            plt.hist(tau_fit_MD.detach().numpy(), weights=3*np.ones(tau_fit_MD.shape[0])/tau_fit_MD.shape[0]*np.max(f.detach().numpy())/np.max(wt.detach().numpy()), bins=100, label="(MD) Asymptotic population density")
-            plt.hist(t.detach().numpy(), weights=4*wt.detach().numpy()*np.max(f.detach().numpy())/np.max(wt.detach().numpy()), bins=150, label="Population density")
-            plt.title("c="+str(c)+", "+weights+", alpha="+str(w_args[0])+", omega="+str(omega))
-            plt.legend()
-            plt.show()
-            
-            output_i = Fx(torch.tensor(tau_init), None, d, wd, c, mu, weights, w_args, omega, method, False) 
-            nu = output_i[-1].to(int)
-            omegai = output_i[-nu-1:-1].to(int)
-            output_i = output_i[:-nu-1]
-            f_i = output_i[:output_i.shape[0]//3]
-            F_i = output_i[output_i.shape[0]//3:2*output_i.shape[0]//3]
-            xi_i = output_i[2*output_i.shape[0]//3:]
-            
-            plt.figure()
-            plt.plot(xi.detach().numpy(), F.detach().numpy(), label="Fit (MD) sample cdf")
-            plt.plot(xi_i.detach().numpy(), F_i.detach().numpy(), label="Init sample cdf")
-            plt.hist(lambda_, bins=200, cumulative = True, histtype="step", density=True, label="Sample cdf")
-            plt.title("c="+str(c)+", "+weights+", alpha="+str(w_args[0])+", omega="+str(omega))
-            plt.legend()
-            plt.show()
-            
-            plt.figure()
-            plt.hist(tau_fit_MD.detach().numpy(), bins=200, cumulative = True, histtype="step", density=True, label="Fit (MD) population cdf")
-            plt.hist(tau_init, bins=200, cumulative = True, histtype="step", density=True, label="Init population cdf")
-            plt.hist(t.detach().numpy(), weights=wt.detach().numpy(), cumulative = True, histtype="step", bins=200, label="Population density")
-            plt.title("c="+str(c)+", "+weights+", alpha="+str(w_args[0])+", omega="+str(omega))
-            plt.legend()
-            plt.show()   
-    
-    return estimator_LD, estimator_MD, tau_init, S
+        
+    return estimator_LD, tau_init, S
 
 def WeSpeR_experiment_2(tau_init = None, p = 2000, n = 20000):
     dtype = np.float64
@@ -700,9 +633,9 @@ if __name__ == '__main__':
     
     warnings.filterwarnings('ignore')
 
-    # estimator_LD, estimator_MD, tau_init, S =  WeSpeR_experiment_1(tau_init = None, p = 100, n = 1000, plots = True)
-    # estimator_LD, estimator_MD, estimator_HD, tau_init, S =  WeSpeR_experiment_2(tau_init = None, p = 100, n = 1000)
-    estimator_LD, estimator_MD = WeSpeR_experiment_3(H_distrib = 1, tau_init = None, p = 2000, n = 20000)
-    # estimator_LD, estimator_MD = WeSpeR_experiment_3(H_distrib = 2, tau_init = None, p = 2000, n = 20000)
-    # estimator_LD, estimator_MD = WeSpeR_experiment_3(H_distrib = 3, tau_init = None, p = 2000, n = 20000)
-    # estimator_LD, estimator_MD = WeSpeR_experiment_3(H_distrib = 4, tau_init = None, p = 2000, n = 20000)
+    estimator_LD, tau_init, S =  WeSpeR_experiment_1(tau_init = None, p = 100, n = 1000, plots = True)
+    # estimator_LD, tau_init, S =  WeSpeR_experiment_2(tau_init = None, p = 100, n = 1000)
+    # estimator_LD, = WeSpeR_experiment_3(H_distrib = 1, tau_init = None, p = 2000, n = 20000)
+    # estimator_LD, = WeSpeR_experiment_3(H_distrib = 2, tau_init = None, p = 2000, n = 20000)
+    # estimator_LD, = WeSpeR_experiment_3(H_distrib = 3, tau_init = None, p = 2000, n = 20000)
+    # estimator_LD, = WeSpeR_experiment_3(H_distrib = 4, tau_init = None, p = 2000, n = 20000)

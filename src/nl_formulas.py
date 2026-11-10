@@ -3,7 +3,7 @@ import scipy as sp
 import numpy as np
 import scipy.stats as stats
 from scipy.optimize import minimize
-from WeSpeR_MD_utils import m_X_w_ewma, m_X_w_unif, m_X_w
+from nl_utils import m_X_w_ewma, m_X_w_unif, m_X_w
 import time
 
 def nl_cov_shrinkage(lambda_, t, wt, d, wd, c = 0.1, weights = 'ewma', w_args = None, method = 'root', verbose = True):

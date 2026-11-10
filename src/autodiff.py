@@ -6,7 +6,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 from sklearn.exceptions import NotFittedError
 
-from autodiff_nl_shrinkage.src.utils import WeSpeR_LD_model, WeSpeR_LD_minimization
+from utils import WeSpeR_LD_model, WeSpeR_LD_minimization
 from nl_formulas import nl_cov_shrinkage, nl_prec_shrinkage
 from weighted_LWO_estimator import wLWO_estimator
 
