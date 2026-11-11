@@ -1,12 +1,11 @@
 [project]
-name = "code"
+name = "autodiff-nl-shrinkage"
 version = "0.1.0"
-description = "Add your description here"
+description = "Non-linear shrinkage of covariance and precision matrices for weighted samples, with the population spectrum identified by automatic differentiation."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.10.7",
-    "numba>=0.62.1",
     "numpy>=2.3.3",
     "scikit-learn>=1.7.2",
     "scipy>=1.16.2",
@@ -16,4 +15,17 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ipykernel>=6.30.1",
+]
+
+[tool.ruff]
+line-length = 140
+exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "N", "RUF"]
+ignore = [
+    "N802", "N803", "N806",  # mathematical notation: S, W, X, U, ... are conventional
+    "N999",                  # module names follow the WeSpeR naming
+    "SIM108",                # long ternaries are less readable than if/else
+    "RUF002", "RUF003",      # keep unicode in comments
 ]

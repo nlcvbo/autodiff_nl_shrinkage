@@ -1,212 +1,323 @@
-import torch
-import scipy as sp
+"""Numerical tools for the non-linear shrinkage formulas.
+
+This module solves the Marchenko-Pastur-type equations satisfied by the
+Stieltjes transform of the sample spectrum for several weight families
+(``"ewma"``, ``"unif"``, ``"Ndiracs"``), and computes the asymptotic sample
+density together with its derivative with respect to the population spectrum
+(:class:`f_xi`).
+"""
+
+from functools import partial
+
 import numpy as np
-from WeSpeR_support_identification_unif import find_support_unif_u, mld_unif, mld_unifp
-from WeSpeR_support_identification_ewma import find_support_exp_u, mld_exp, mld_expp
-from WeSpeR_support_identification_Ndiracs import find_support_Ndiracs_u, mld_Ndiracs, mld_Ndiracsp
-import scipy.stats as stats
-import matplotlib.pyplot as plt
+import torch
 from scipy.optimize import minimize
-import time
+
+from WeSpeR_support_identification_ewma import find_support_exp_u, mld_exp, mld_expp
+from WeSpeR_support_identification_Ndiracs import (
+    find_support_Ndiracs_u,
+    mld_Ndiracs,
+    mld_Ndiracsp,
+)
+from WeSpeR_support_identification_unif import find_support_unif_u, mld_unif, mld_unifp
+
+# A solution of the fixed-point equation is accepted if its squared residual is
+# below this tolerance.
+RESIDUAL_TOL = 1e-4
+
+
+def _split_ab(ab):
+    """Split a flat numpy vector ``[a_1..a_k, b_1..b_k]`` into two tensors."""
+    ab = torch.from_numpy(ab)
+    half = ab.shape[0] // 2
+    return ab[:half], ab[half:]
+
 
 def m_tilde_loss_w(ab, x, w, ww, c, t, wt):
-    ab = torch.from_numpy(ab)
-    a = ab[:ab.shape[0]//2]
-    b = ab[ab.shape[0]//2:]
-    u = 1 + c*w[None,:]*(wt[None,:]*(t[None,:]*a[:,None]-x[:,None])*t[None,:]/((t[None,:]*a[:,None]-x[:,None])**2+t[None,:]**2*(-torch.exp(b)[:,None])**2)).sum(axis=1)[:,None]
-    v = - c*w[None,:]*(wt[None,:]*t[None,:]**2*(-torch.exp(b)[:,None])/((t[None,:]*a[:,None]-x[:,None])**2+t[None,:]**2*(-torch.exp(b)[:,None])**2)).sum(axis=1)[:,None]
-    loss = (a - (w[None,:]*ww[None,:]*u/(u**2+v**2)).sum(axis=1))**2 + (-torch.exp(b) + (w[None,:]*ww[None,:]*v/(u**2+v**2)).sum(axis=1))**2
+    """Squared residual of the equation satisfied by ``m_tilde`` (general weights).
+
+    ``m_tilde = a - i exp(b)`` is parametrised by ``ab = [a, b]``; ``x`` is
+    the evaluation point, ``(w, ww)`` the support and probabilities of the
+    weight distribution, ``c`` the concentration ratio and ``(t, wt)`` the
+    support and probabilities of the population spectrum.
+    """
+    a, b = _split_ab(ab)
+    sq = (t[None, :] * a[:, None] - x[:, None]) ** 2 + t[None, :] ** 2 * torch.exp(b)[:, None] ** 2
+    u = 1 + c * w[None, :] * (wt[None, :] * (t[None, :] * a[:, None] - x[:, None]) * t[None, :] / sq).sum(axis=1)[:, None]
+    v = c * w[None, :] * (wt[None, :] * t[None, :] ** 2 * torch.exp(b)[:, None] / sq).sum(axis=1)[:, None]
+    loss = (a - (w[None, :] * ww[None, :] * u / (u**2 + v**2)).sum(axis=1)) ** 2 + (
+        -torch.exp(b) + (w[None, :] * ww[None, :] * v / (u**2 + v**2)).sum(axis=1)
+    ) ** 2
     return loss.mean().item()
+
 
 def X_loss_w(ab, x, w, ww, c, t, wt):
-    ab = torch.from_numpy(ab)
-    a = ab[:ab.shape[0]//2]
-    b = ab[ab.shape[0]//2:]
-    X = a + np.exp(b)*1j
-    loss = torch.abs(X + (ww[None,:]*w[None,:]/(x[:,None] - c*w[None,:]*(wt[None,:]*t[None,:]/(1 + t[None,:]*X[:,None])).sum(axis=1)[:,None])).sum(axis=1))**2
+    """Squared residual of the equation satisfied by ``X`` (general weights)."""
+    a, b = _split_ab(ab)
+    X = a + torch.exp(b) * 1j
+    denominator = x[:, None] - c * w[None, :] * (wt[None, :] * t[None, :] / (1 + t[None, :] * X[:, None])).sum(axis=1)[:, None]
+    loss = torch.abs(X + (ww[None, :] * w[None, :] / denominator).sum(axis=1)) ** 2
     return loss.mean().item()
+
+
+def _m_tilde_loss_mld(ab, x, mld, alpha, c, t, wt):
+    """Squared residual of the ``m_tilde`` equation for a closed-form weight law."""
+    a, b = _split_ab(ab)
+    m_tilde = a - torch.exp(b) * 1j
+    theta = c * (wt[None, :] * t[None, :] / (t[None, :] * m_tilde[:, None] - x[:, None])).sum(axis=1)
+    integral = mld(-1 / theta, alpha) / theta
+    return (torch.abs(m_tilde - integral) ** 2).mean().item()
+
+
+def _X_loss_mld(ab, x, mld, alpha, c, t, wt):
+    """Squared residual of the ``X`` equation for a closed-form weight law."""
+    a, b = _split_ab(ab)
+    X = a + torch.exp(b) * 1j
+    theta = c * (wt[None, :] * t[None, :] / (t[None, :] * X[:, None] + 1)).sum(axis=1)
+    integral = mld(x / theta, alpha) / theta
+    return (torch.abs(X - integral) ** 2).mean().item()
+
+
+def _solve_m_X(x, t, wt, m_tilde_loss, X_loss, X_start, z_imag):
+    """Solve for ``m_tilde`` and ``X`` at each point of ``x`` by minimisation.
+
+    For ``x != 0`` the residual of ``m_tilde`` is minimised (warm-started with
+    the previous solution) and ``X = -m_tilde / x``. At ``x == 0`` the
+    residual of ``X`` is minimised instead, starting from its solution at
+    ``z = i * z_imag``.
+
+    Parameters
+    ----------
+    x : torch.Tensor of shape (k,)
+        Evaluation points.
+    t, wt : torch.Tensor
+        Support and probabilities of the population spectrum.
+    m_tilde_loss, X_loss : callable ``(ab, x) -> float``
+        Residuals to minimise, as functions of the flat parameter vector
+        ``[a, b]`` and of the evaluation point.
+    X_start : ndarray of shape (2,)
+        Starting point for the ``X`` equation at ``z = i * z_imag``.
+    z_imag : float
+        Imaginary part of the point where the ``X`` equation is first solved.
+
+    Returns
+    -------
+    m : torch.Tensor of shape (k,), complex
+        Stieltjes transform of the sample spectrum.
+    X : torch.Tensor of shape (k,), complex
+        Auxiliary Stieltjes-type transform.
+    """
+    X = torch.zeros(x.shape, dtype=torch.cfloat)
+    m_tilde = torch.zeros(x.shape, dtype=torch.cfloat)
+    x_last = np.zeros(2)
+    for i in range(x.shape[0]):
+        if x[i] != 0:
+            res = minimize(m_tilde_loss, x0=x_last, args=(x[i : i + 1],))
+            if res.fun < RESIDUAL_TOL:
+                ab = torch.from_numpy(res.x)
+                x_last = res.x
+            else:
+                ab = torch.tensor([0, -1e1], dtype=torch.float)
+                x_last = np.zeros(2)
+            m_tilde[i] = ab[0] - torch.exp(ab[1]) * 1j
+            X[i] = -m_tilde[i] / x[i]
+        else:
+            z = z_imag * 1j * torch.ones(1, dtype=torch.cfloat)
+            res = minimize(X_loss, x0=X_start, args=(z,))
+            res = minimize(X_loss, x0=res.x[:1], args=(x[i : i + 1],))
+            x_last = np.zeros(2)
+            m_tilde[i] = 0
+            X[i] = torch.from_numpy(res.x)[0]
+    m = torch.zeros(x.shape, dtype=torch.cfloat)
+    m[m_tilde != 0] = (wt[None, :] / (t[None, :] * m_tilde[:, None] - x[:, None]).to(torch.cfloat)[m_tilde != 0]).sum(axis=1)
+    return m, X
+
 
 def m_X_w(x, w, ww, c, t, wt):
-    X = torch.zeros(x.shape, dtype=torch.cfloat)
-    m_tilde = torch.zeros(x.shape, dtype=torch.cfloat)
-    x_last = np.zeros(2)
-    for i in range(x.shape[0]):
-        x0 = x_last
-        if x[i] != 0:
-            m = minimize(m_tilde_loss_w, x0 = x0, args = (x[i:i+1], w, ww, c, t, wt), options={'disp':False})
-            if m.fun < 1e-4:
-                ab = torch.from_numpy(m.x)
-                x_last = m.x
-            else:
-                ab = torch.tensor([0,-1e1], dtype=torch.float)
-                x_last = np.zeros(2)
-            m_tilde[i] = ab[0] - torch.exp(ab[1])*1j
-            X[i] = -m_tilde[i]/x[i]
-        else:
-            z = 1e-5*1j*torch.ones(1, dtype=torch.cfloat)
-            m = minimize(X_loss_w, x0 = np.zeros(2), args = (z, w, ww, c, t, wt), options={'disp':False})
-            x0 = m.x[:1]
-            m = minimize(X_loss_w, x0 = x0, args = (x[i:i+1], w, ww, c, t, wt), options={'disp':False})
-            ab = torch.from_numpy(m.x)
-            x_last = np.zeros(2)
-            m_tilde[i] = 0
-            X[i] = ab[0]
-    m = torch.zeros(x.shape, dtype=torch.cfloat)
-    m[m_tilde != 0] = (wt[None,:]/(t[None,:]*m_tilde[:,None] - x[:,None]).to(torch.cfloat)[m_tilde != 0]).sum(axis=1)
-    return m, X
+    """Stieltjes transforms ``(m, X)`` of the sample spectrum, general weights.
 
-def m_tilde_loss_w_ewma(ab, x, alpha, c, t, wt):
-    ab = torch.from_numpy(ab)
-    a = ab[:ab.shape[0]//2]
-    b = ab[ab.shape[0]//2:]
-    m_tilde = a - torch.exp(b)*1j
-    theta = c*(wt[None,:]*t[None,:]/(t[None,:]*m_tilde[:,None]-x[:,None])).sum(axis=1)
-    integral = mld_exp(-1/theta, alpha)/theta 
-    loss = torch.abs(m_tilde - integral)**2
-    return loss.mean().item()
+    Parameters
+    ----------
+    x : torch.Tensor of shape (k,)
+        Evaluation points on the real axis.
+    w, ww : torch.Tensor
+        Support and probabilities of the weight distribution.
+    c : float
+        Concentration ratio ``p / n``.
+    t, wt : torch.Tensor
+        Support and probabilities of the population spectrum.
+    """
+    return _solve_m_X(
+        x,
+        t,
+        wt,
+        partial(m_tilde_loss_w, w=w, ww=ww, c=c, t=t, wt=wt),
+        partial(X_loss_w, w=w, ww=ww, c=c, t=t, wt=wt),
+        X_start=np.zeros(2),
+        z_imag=1e-5,
+    )
 
-def X_loss_w_ewma(ab, x, alpha, c, t, wt):
-    ab = torch.from_numpy(ab)
-    a = ab[:ab.shape[0]//2]
-    b = ab[ab.shape[0]//2:]
-    X = a + np.exp(b)*1j
-    theta = c*(wt[None,:]*t[None,:]/(t[None,:]*X[:,None] + 1)).sum(axis=1)
-    integral = mld_exp(x/theta, alpha)/theta 
-    loss = torch.abs(X - integral)**2
-    return loss.mean().item()
 
 def m_X_w_ewma(x, alpha, c, t, wt):
-    X = torch.zeros(x.shape, dtype=torch.cfloat)
-    m_tilde = torch.zeros(x.shape, dtype=torch.cfloat)
-    x_last = np.zeros(2)
-    for i in range(x.shape[0]):
-        x0 = x_last
-        if x[i] != 0:
-            m = minimize(m_tilde_loss_w_ewma, x0 = x0, args = (x[i:i+1], alpha, c, t, wt), options={'disp':False})
-            if m.fun < 1e-4:
-                ab = torch.from_numpy(m.x)
-                x_last = m.x
-            else:
-                ab = torch.tensor([0,-1e1], dtype=torch.float)
-                x_last = np.zeros(2)
-            m_tilde[i] = ab[0] - torch.exp(ab[1])*1j
-            X[i] = -m_tilde[i]/x[i]
-        else:
-            z = 1e-3*1j*torch.ones(1, dtype=torch.cfloat)
-            m = minimize(X_loss_w_ewma, x0 = np.array([float((wt*t).sum()), 0.0]), args = (z, alpha, c, t, wt), options={'disp':False})
-            x0 = m.x[:1]
-            m = minimize(X_loss_w_ewma, x0 = x0, args = (x[i:i+1], alpha, c, t, wt), options={'disp':False})
-            ab = torch.from_numpy(m.x)
-            x_last = np.zeros(2)
-            m_tilde[i] = 0
-            X[i] = ab[0]
-    m = torch.zeros(x.shape, dtype=torch.cfloat)
-    m[m_tilde != 0] = (wt[None,:]/(t[None,:]*m_tilde[:,None] - x[:,None]).to(torch.cfloat)[m_tilde != 0]).sum(axis=1)
-    return m, X
+    """Stieltjes transforms ``(m, X)`` for exponentially weighted samples.
 
-def m_tilde_loss_w_unif(ab, x, alpha, c, t, wt):
-    ab = torch.from_numpy(ab)
-    a = ab[:ab.shape[0]//2]
-    b = ab[ab.shape[0]//2:]
-    m_tilde = a - torch.exp(b)*1j
-    theta = c*(wt[None,:]*t[None,:]/(t[None,:]*m_tilde[:,None]-x[:,None])).sum(axis=1)
-    integral = mld_unif(-1/theta, alpha)/theta 
-    loss = torch.abs(m_tilde - integral)**2
-    return loss.mean().item()
+    Same as :func:`m_X_w` with weights ``W_i ~ exp(-alpha * i / n)``.
+    """
+    return _solve_m_X(
+        x,
+        t,
+        wt,
+        partial(_m_tilde_loss_mld, mld=mld_exp, alpha=alpha, c=c, t=t, wt=wt),
+        partial(_X_loss_mld, mld=mld_exp, alpha=alpha, c=c, t=t, wt=wt),
+        X_start=np.array([float((wt * t).sum()), 0.0]),
+        z_imag=1e-3,
+    )
 
-def X_loss_w_unif(ab, x, alpha, c, t, wt):
-    ab = torch.from_numpy(ab)
-    a = ab[:ab.shape[0]//2]
-    b = ab[ab.shape[0]//2:]
-    X = a + np.exp(b)*1j
-    theta = c*(wt[None,:]*t[None,:]/(t[None,:]*X[:,None] + 1)).sum(axis=1)
-    integral = mld_unif(x/theta, alpha)/theta 
-    loss = torch.abs(X - integral)**2
-    return loss.mean().item()
 
 def m_X_w_unif(x, alpha, c, t, wt):
-    X = torch.zeros(x.shape, dtype=torch.cfloat)
-    m_tilde = torch.zeros(x.shape, dtype=torch.cfloat)
-    x_last = np.zeros(2)
-    for i in range(x.shape[0]):
-        x0 = x_last
-        if x[i] != 0:
-            m = minimize(m_tilde_loss_w_unif, x0 = x0, args = (x[i:i+1], alpha, c, t, wt), options={'disp':False})
-            if m.fun < 1e-4:
-                ab = torch.from_numpy(m.x)
-                x_last = m.x
-            else:
-                ab = torch.tensor([0,-1e1], dtype=torch.float)
-                x_last = np.zeros(2)
-            m_tilde[i] = ab[0] - torch.exp(ab[1])*1j
-            X[i] = -m_tilde[i]/x[i]
-        else:
-            z = 1e-5*1j*torch.ones(1, dtype=torch.cfloat)
-            m = minimize(X_loss_w_unif, x0 = np.zeros(2), args = (z, alpha, c, t, wt), options={'disp':False})
-            x0 = m.x[:1]
-            m = minimize(X_loss_w_unif, x0 = x0, args = (x[i:i+1], alpha, c, t, wt), options={'disp':False})
-            ab = torch.from_numpy(m.x)
-            x_last = np.zeros(2)
-            m_tilde[i] = 0
-            X[i] = ab[0]
-    m = torch.zeros(x.shape, dtype=torch.cfloat)
-    m[m_tilde != 0] = (wt[None,:]/(t[None,:]*m_tilde[:,None] - x[:,None]).to(torch.cfloat)[m_tilde != 0]).sum(axis=1)
-    return m, X
+    """Stieltjes transforms ``(m, X)`` for linearly weighted samples.
 
-def WeSpeR_support_u(tau, wtau, d, wd, c, weights, w_args, method = None, verbose = True):
+    Same as :func:`m_X_w` with weights uniformly distributed on
+    ``[1 - alpha/2, 1 + alpha/2]``.
+    """
+    return _solve_m_X(
+        x,
+        t,
+        wt,
+        partial(_m_tilde_loss_mld, mld=mld_unif, alpha=alpha, c=c, t=t, wt=wt),
+        partial(_X_loss_mld, mld=mld_unif, alpha=alpha, c=c, t=t, wt=wt),
+        X_start=np.zeros(2),
+        z_imag=1e-5,
+    )
+
+
+def m_X(x, weights, w_args, d, wd, c, t, wt):
+    """Dispatch to :func:`m_X_w_ewma`, :func:`m_X_w_unif` or :func:`m_X_w`.
+
+    Parameters
+    ----------
+    weights : {"ewma", "unif", "Ndiracs"}
+        Family of the sample weights; any other value is treated as a general
+        discrete weight distribution ``(d, wd)``.
+    w_args : list
+        Parameters of the weight family; ``w_args[0]`` is ``alpha`` for
+        ``"ewma"`` and ``"unif"``.
+    d, wd : torch.Tensor
+        Support and probabilities of the weight distribution.
+
+    See :func:`m_X_w` for the other parameters.
+    """
+    if weights == "ewma":
+        return m_X_w_ewma(x, w_args[0], c, t, wt)
+    if weights == "unif":
+        return m_X_w_unif(x, w_args[0], c, t, wt)
+    return m_X_w(x, d, wd, c, t, wt)
+
+
+def WeSpeR_support_u(tau, wtau, d, wd, c, weights, w_args, method=None, verbose=True):
+    """Identify the support of the asymptotic sample spectrum.
+
+    Parameters
+    ----------
+    tau, wtau : ndarray
+        Atoms and probabilities of the population spectrum (repeated atoms
+        are merged).
+    d, wd : ndarray
+        Support and probabilities of the weight distribution.
+    c : float
+        Concentration ratio ``p / n``.
+    weights : {"ewma", "unif", "Ndiracs", "test"}
+        Family of the sample weights.
+    w_args : list
+        Parameters of the weight family: ``[alpha, Kt]`` for ``"ewma"`` and
+        ``"unif"``, ``[Kd, Kt]`` for ``"Ndiracs"``.
+    method : str, optional
+        Root-finding method.
+    verbose : bool, default=True
+        Verbosity of the support identification.
+
+    Returns
+    -------
+    support, u, mldm, tildeomegai : torch.Tensor
+        Edges of the support intervals, the corresponding points ``u``, the
+        values of the weight transform at ``u`` and the mass of each interval.
+    """
     t = np.unique(tau)
     wt = np.zeros(t.shape)
     for i in range(len(t)):
         wt[i] = wtau[tau == t[i]].sum()
-    
-    if weights == "ewma":
-        alpha = w_args[0]
-        Kt = w_args[1]
-        support, u, mldm, tildeomegai  = find_support_exp_u(c, alpha, t, wt, Kt = Kt, eps=1e-1, method=method, verbose = verbose)
-        
-    elif weights == "unif":
-        alpha = w_args[0]
-        Kt = w_args[1]
-        support, u, mldm, tildeomegai  = find_support_unif_u(c, alpha, t, wt, Kt = Kt, eps=1e-1, method=method, verbose = verbose)
-        
+
+    if weights in ("ewma", "unif"):
+        alpha, Kt = w_args[0], w_args[1]
+        find_support = find_support_exp_u if weights == "ewma" else find_support_unif_u
+        support, u, mldm, tildeomegai = find_support(c, alpha, t, wt, Kt=Kt, eps=1e-1, method=method, verbose=verbose)
     elif weights == "Ndiracs":
-        Kd = w_args[0]
-        Kt = w_args[1]
-        try:
-            assert wd.shape == d.shape
-        except:
-            wd = np.ones(d.shape[0])/d.shape[0]
-        support, u, mldm, tildeomegai = find_support_Ndiracs_u(c, wd, d, t, wt, Kt = Kt, Kd = Kd, eps=1e-2, method=method, verbose = verbose)
+        Kd, Kt = w_args[0], w_args[1]
+        if wd.shape != d.shape:
+            wd = np.ones(d.shape[0]) / d.shape[0]
+        support, u, mldm, tildeomegai = find_support_Ndiracs_u(c, wd, d, t, wt, Kt=Kt, Kd=Kd, eps=1e-2, method=method, verbose=verbose)
     elif weights == "test":
-        support, u, mldm, tildeomegai = np.array([0.1, 10]), \
-                                    np.array([-1/tau[0]-1,-1/tau[-1]+1]), \
-                                    np.array([1-1/(-1/tau[0]-1),1-1/(-1/tau[-1]+1)]), \
-                                    np.ones(1)
-                                    
+        support = np.array([0.1, 10])
+        u = np.array([-1 / tau[0] - 1, -1 / tau[-1] + 1])
+        mldm = np.array([1 - 1 / (-1 / tau[0] - 1), 1 - 1 / (-1 / tau[-1] + 1)])
+        tildeomegai = np.ones(1)
+    else:
+        raise ValueError(f"Unknown weights family: {weights!r}")
+
     return torch.from_numpy(support), torch.from_numpy(u), torch.from_numpy(mldm), torch.from_numpy(tildeomegai)
 
-def WeSpeR_density(omega, support, d, wd, c, tau, tildeomegai, mu=0.1, wt = None, weights = 'test', w_args = None, verbose = True):
+
+def WeSpeR_density(omega, support, d, wd, c, tau, tildeomegai, mu=0.1, wt=None, weights="test", w_args=None):
+    """Compute the asymptotic sample density and cdf on an adaptive grid.
+
+    Parameters
+    ----------
+    omega : int
+        Total number of grid points.
+    support : torch.Tensor
+        Edges of the support intervals (as returned by :func:`WeSpeR_support_u`).
+    d, wd : torch.Tensor
+        Support and probabilities of the weight distribution.
+    c : float
+        Concentration ratio ``p / n``.
+    tau : torch.Tensor
+        Atoms of the population spectrum.
+    tildeomegai : torch.Tensor
+        Mass of each support interval.
+    mu : float, default=0.1
+        Fraction of the grid points spread uniformly over the intervals
+        (the rest is allocated proportionally to ``tildeomegai``).
+    wt : torch.Tensor, optional
+        Probabilities of the atoms of ``tau`` (uniform if None).
+    weights : str, default="test"
+        Family of the sample weights.
+    w_args : list, optional
+        Parameters of the weight family.
+
+    Returns
+    -------
+    xi, f, F, G, X, omegai, i_idx, j_idx, sin2, nu
+        Grid, density, cdf, un-normalised cdf, ``X`` on the grid, number of
+        points per interval, interval / position indices, ``sin(.)**2``
+        grid coordinates and number of intervals.
+    """
     if support.shape[0] % 2 != 0:
-        support = np.concatenate([support, [tau[-1]*d[-1]*(1+np.sqrt(c))**2]])
-        
-    nu = support.shape[0]//2
-    
-    mu = max(0,min(mu,1))
-    
-    # Number of points
-    omegai = (mu/nu + (1-mu)*tildeomegai)*omega
-    
-    # Discretization
+        support = np.concatenate([support, [tau[-1] * d[-1] * (1 + np.sqrt(c)) ** 2]])
+
+    nu = support.shape[0] // 2
+
+    mu = max(0, min(mu, 1))
+
+    # Number of points per interval
+    omegai = (mu / nu + (1 - mu) * tildeomegai) * omega
     if omegai.sum() > 0:
-        omegai = torch.round(omegai*omega/omegai.sum()+0.5).to(int)
+        omegai = torch.round(omegai * omega / omegai.sum() + 0.5).to(int)
     else:
-        omegai = torch.round(omega*torch.ones(nu)/nu+0.5).to(int)
-    
-    try:
-        assert wt.shape == tau.shape
-    except:
-        wt = torch.ones(tau.shape[0])/tau.shape[0]
-    
+        omegai = torch.round(omega * torch.ones(nu) / nu + 0.5).to(int)
+
+    if wt is None or wt.shape != tau.shape:
+        wt = torch.ones(tau.shape[0]) / tau.shape[0]
+
     # Grid
     grid = torch.zeros(0)
     density = torch.zeros(0)
@@ -215,92 +326,118 @@ def WeSpeR_density(omega, support, d, wd, c, tau, tildeomegai, mu=0.1, wt = None
     j_idx = torch.zeros(0, dtype=int)
     sin2 = torch.zeros(0)
     for i in range(nu):
-        ul = support[2*i]
-        ur = support[2*i+1]
+        ul = support[2 * i]
+        ur = support[2 * i + 1]
         j = torch.ones(omegai[i]).cumsum(axis=0)
-        xij = ul + (ur-ul)*torch.sin(np.pi*j/2/(omegai[i]+1))**2
-        
-        if weights == "ewma":
-            alpha = w_args[0]
-            m, Xij = m_X_w_ewma(xij, alpha, c, tau, wt)
-            
-        elif weights == "unif":
-            alpha = w_args[0]
-            m, Xij = m_X_w_unif(xij, alpha, c, tau, wt)
-            
-        elif weights == "Ndiracs":
-            m, Xij = m_X_w(xij, d, wd, c, tau, wt)
-            
-        else:
-            m, Xij = m_X_w(xij, d, wd, c, tau, wt)
-            
-        f = torch.abs(m.imag)/np.pi
-        
-        grid = torch.concatenate([grid, ul*torch.ones(1), xij, ur*torch.ones(1)])
+        xij = ul + (ur - ul) * torch.sin(np.pi * j / 2 / (omegai[i] + 1)) ** 2
+
+        m, Xij = m_X(xij, weights, w_args, d, wd, c, tau, wt)
+        f = torch.abs(m.imag) / np.pi
+
+        grid = torch.concatenate([grid, ul * torch.ones(1), xij, ur * torch.ones(1)])
         density = torch.concatenate([density, torch.zeros(1), f, torch.zeros(1)])
         X = torch.concatenate([X, torch.zeros(1), Xij, torch.zeros(1)])
-        j_idx = torch.concatenate([j_idx, torch.ones(omegai[i]+2, dtype=int).cumsum(axis=0) - 1])
-        i_idx = torch.concatenate([i_idx, 2*i*torch.ones(omegai[i]+2, dtype=int)])
-        sin2 = torch.concatenate([sin2,  torch.zeros(1), torch.sin(np.pi*j/2/(omegai[i]+1))**2, torch.ones(1)])
-    
+        j_idx = torch.concatenate([j_idx, torch.ones(omegai[i] + 2, dtype=int).cumsum(axis=0) - 1])
+        i_idx = torch.concatenate([i_idx, 2 * i * torch.ones(omegai[i] + 2, dtype=int)])
+        sin2 = torch.concatenate([sin2, torch.zeros(1), torch.sin(np.pi * j / 2 / (omegai[i] + 1)) ** 2, torch.ones(1)])
+
     xi = grid.to(tau.dtype)
     f = density.to(tau.dtype)
-    X = X
-    
-    F0 = max(0,1-1/c)
+
+    F0 = max(0, 1 - 1 / c)
     G = torch.zeros(xi.shape, dtype=tau.dtype)
     F = torch.zeros(xi.shape, dtype=tau.dtype)
     G[0] = F0
     F[0] = F0
     for i in range(nu):
-        j = torch.ones(omegai[i]+1, dtype=int).cumsum(0)
-        offset = omegai[:i].sum(axis=0) + 2*i
+        j = torch.ones(omegai[i] + 1, dtype=int).cumsum(0)
+        offset = omegai[:i].sum(axis=0) + 2 * i
         if offset > 0:
-            G[offset] = F[offset-1]
-            F[offset] = F[offset-1]
-        G[j+offset] = G[offset] + 1/2*((xi[j+offset] - xi[j-1+offset])*(f[j+offset] + f[j-1+offset])).cumsum(axis=0)
+            G[offset] = F[offset - 1]
+            F[offset] = F[offset - 1]
+        G[j + offset] = G[offset] + 1 / 2 * ((xi[j + offset] - xi[j - 1 + offset]) * (f[j + offset] + f[j - 1 + offset])).cumsum(axis=0)
         if tildeomegai.sum(axis=0) > 0:
-            if (G[offset+j][-1] - F[offset]).to(float) > 0:
-                F[j+offset] = F[offset] + tildeomegai[i]*(1-F[0])*(G[offset+j] - F[offset])/(G[offset+j][-1] - F[offset])
+            if (G[offset + j][-1] - F[offset]).to(float) > 0:
+                F[j + offset] = F[offset] + tildeomegai[i] * (1 - F[0]) * (G[offset + j] - F[offset]) / (G[offset + j][-1] - F[offset])
             else:
-                F[j+offset] = F[offset] + tildeomegai[i]*(1-F[0])*j/j[-1]
+                F[j + offset] = F[offset] + tildeomegai[i] * (1 - F[0]) * j / j[-1]
         else:
-            F[j+offset] = G[j+offset]
+            F[j + offset] = G[j + offset]
     if tildeomegai.sum(axis=0) == 0:
-        F = G/G[-1]
+        F = G / G[-1]
     return xi, f, F, G, X, omegai, i_idx, j_idx, sin2, nu
 
-class f_xi(torch.autograd.Function):
-    """
-    We can implement our own custom autograd Functions by subclassing
-    torch.autograd.Function and implementing the forward and backward passes
-    which operate on Tensors.
+
+class f_xi(torch.autograd.Function):  # noqa: N801
+    """Differentiable asymptotic sample density and cdf.
+
+    ``f_xi.apply(tau, wt, d, wd, c, mu, weights, w_args, omega, method, verbose)``
+    returns the flat tensor ``[f, F, xi, omegai, nu]`` where ``xi`` is the grid
+    of points, ``f`` the density and ``F`` the cdf on that grid, ``omegai`` the
+    number of grid points per support interval and ``nu`` the number of
+    intervals. The backward pass differentiates the output with respect to
+    the atoms ``tau`` of the population spectrum.
     """
 
     @staticmethod
-    def forward(ctx, input, wt = None, d = torch.ones(1), wd = torch.ones(1), c = 0.1, mu = 0.1, weights = 'test', w_args = None, omega = 100, method = 'root', verbose = True):
-        """
-        In the forward pass we receive a Tensor containing the input and return
-        a Tensor containing the output. ctx is a context object that can be used
-        to stash information for backward computation. You can cache arbitrary
-        objects for use in the backward pass using the ctx.save_for_backward method.
+    def forward(
+        ctx,
+        input,
+        wt=None,
+        d=None,
+        wd=None,
+        c=0.1,
+        mu=0.1,
+        weights="test",
+        w_args=None,
+        omega=100,
+        method="root",
+        verbose=True,
+    ):
+        """Compute the density and cdf of the sample spectrum.
+
+        Parameters
+        ----------
+        input : torch.Tensor of shape (p,)
+            Atoms ``tau`` of the population spectrum, sorted.
+        wt : torch.Tensor, optional
+            Probabilities of the atoms (uniform if None).
+        d, wd : torch.Tensor, optional
+            Support and probabilities of the weight distribution.
+        c : float
+            Concentration ratio ``p / n``.
+        mu : float
+            Fraction of the grid points spread uniformly (see
+            :func:`WeSpeR_density`).
+        weights : str
+            Family of the sample weights.
+        w_args : list
+            Parameters of the weight family.
+        omega : int
+            Number of grid points.
+        method : str
+            Root-finding method for the support identification.
+        verbose : bool
+            Verbosity.
         """
         tau = input
-        
-        if d == None:
+
+        if d is None:
             d = torch.ones(1)
-        if wd == None or wd.shape != d.shape:
-            wd = torch.ones(d.shape[0])/d.shape[0]
-        if wt == None:
-            wt = torch.ones(tau.shape[0])/tau.shape[0]
-        
-        
-        
-        support, u, mldm, tildeomegai = WeSpeR_support_u(tau.detach().numpy(), wt.numpy(), d.numpy(), wd.numpy(), c, weights, w_args, method = method, verbose = verbose)
-        
-        xi, f, F, G, X, omegai, i_idx, j_idx, sin2, nu = WeSpeR_density(omega, support, d, wd, c, tau, tildeomegai, mu=mu, wt = wt, weights = weights, w_args = w_args, verbose = verbose)
-        
-        output = torch.concatenate([f, F, xi, omegai, nu*torch.ones(1)])
+        if wd is None or wd.shape != d.shape:
+            wd = torch.ones(d.shape[0]) / d.shape[0]
+        if wt is None:
+            wt = torch.ones(tau.shape[0]) / tau.shape[0]
+
+        support, u, mldm, tildeomegai = WeSpeR_support_u(
+            tau.detach().numpy(), wt.numpy(), d.numpy(), wd.numpy(), c, weights, w_args, method=method, verbose=verbose
+        )
+
+        xi, f, F, G, X, omegai, i_idx, j_idx, sin2, nu = WeSpeR_density(
+            omega, support, d, wd, c, tau, tildeomegai, mu=mu, wt=wt, weights=weights, w_args=w_args
+        )
+
+        output = torch.concatenate([f, F, xi, omegai, nu * torch.ones(1)])
         ctx.save_for_backward(input, output)
         ctx.wt = wt
         ctx.d = d
@@ -326,381 +463,104 @@ class f_xi(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        """
-        In the backward pass we receive a Tensor containing the gradient of the loss
-        with respect to the output, and we need to compute the gradient of the loss
-        with respect to the input.
-        """
-        input, output = ctx.saved_tensors
-        tau = input
+        """Differentiate the output of :meth:`forward` with respect to ``tau``."""
+        tau, _ = ctx.saved_tensors
         wt = ctx.wt
         d = ctx.d
         wd = ctx.wd
         c = ctx.c
         weights = ctx.weights
         w_args = ctx.w_args
-        omega = ctx.omega
         u = ctx.u
         mldm = ctx.mldm
         omegai = ctx.omegai
         tildeomegai = ctx.tildeomegai
         i_idx = ctx.i_idx
-        j_idx = ctx.j_idx
         sin2 = ctx.sin2
         X = ctx.X
         f = ctx.f
-        xi = ctx.xi        
+        xi = ctx.xi
         nu = ctx.nu
         G = ctx.G
         F = ctx.F
-            
-        tu = c*(wt[None,:]*tau[None,:]/(tau[None,:]-u[:,None])).sum(axis=1)
-        theta = c*(tau[None,:]*wt[None,:]/(tau[None,:]*X[:,None]+1)).sum(axis=1)
-        
+
+        tu = c * (wt[None, :] * tau[None, :] / (tau[None, :] - u[:, None])).sum(axis=1)
+        theta = c * (tau[None, :] * wt[None, :] / (tau[None, :] * X[:, None] + 1)).sum(axis=1)
+
         if weights == "ewma":
             alpha = w_args[0]
-            mldmp = mld_expp(mldm,alpha)
-            integral1 = (mld_exp(xi/theta,alpha)+xi/theta*mld_expp(xi/theta,alpha))/theta**2
-            integral3 = mld_expp(xi/theta,alpha)/theta**2
-            
+            mldmp = mld_expp(mldm, alpha)
+            integral1 = (mld_exp(xi / theta, alpha) + xi / theta * mld_expp(xi / theta, alpha)) / theta**2
+            integral3 = mld_expp(xi / theta, alpha) / theta**2
+
         elif weights == "unif":
             alpha = w_args[0]
-            mldmp = mld_unifp(mldm,alpha)
-            integral1 = (mld_unif(xi/theta,alpha)+xi/theta*mld_unifp(xi/theta,alpha))/theta**2
-            integral3 = mld_unifp(xi/theta,alpha)/theta**2
-            
+            mldmp = mld_unifp(mldm, alpha)
+            integral1 = (mld_unif(xi / theta, alpha) + xi / theta * mld_unifp(xi / theta, alpha)) / theta**2
+            integral3 = mld_unifp(xi / theta, alpha) / theta**2
+
         elif weights == "Ndiracs":
             mldmp = mld_Ndiracsp(mldm, wd, d)
-            integral1 = (mld_Ndiracs(xi/theta, wd, d)+xi/theta*mld_Ndiracsp(xi/theta, wd, d))/theta**2
-            integral3 = mld_Ndiracsp(xi/theta, wd, d)/theta**2
-            
+            integral1 = (mld_Ndiracs(xi / theta, wd, d) + xi / theta * mld_Ndiracsp(xi / theta, wd, d)) / theta**2
+            integral3 = mld_Ndiracsp(xi / theta, wd, d) / theta**2
+
         else:
-            mldmp = (wd[None,:]*d[None,:]/(d[None,:]-mldm[:,None])**2).sum(axis=1)
-            integral1 = (wd[None,:]*d[None,:]**2/(xi[:,None] - d[None,:]*theta[None,:])**2).sum(axis=1)
-            integral3 = (wd[None,:]*d[None,:]/(xi[:,None] - d[None,:]*theta[None,:])**2).sum(axis=1)
-                
-        dsidtk = c*u[:,None]**2*wt[None,:]/(tau[None,:] - u[:,None])**2*(mldm[:,None] + tu[:,None]/mldmp[:,None])
-        
-        dxiidtk = (1-sin2[:,None])*dsidtk[i_idx,:] + sin2[:,None]*dsidtk[i_idx+1,:]
-        
-        integral2 = c*(wt[None,:]*tau[None,:]**2/(tau[None,:]*X[:,None]+1)**2).sum(axis=1)
-        dhatGammaidtk = c*wt[None,:]/(tau[None,:]*X[:,None]+1)**2*integral1[:,None]
-        dhatGammaidXi = 1 - integral2*integral1
+            mldmp = (wd[None, :] * d[None, :] / (d[None, :] - mldm[:, None]) ** 2).sum(axis=1)
+            integral1 = (wd[None, :] * d[None, :] ** 2 / (xi[:, None] - d[None, :] * theta[None, :]) ** 2).sum(axis=1)
+            integral3 = (wd[None, :] * d[None, :] / (xi[:, None] - d[None, :] * theta[None, :]) ** 2).sum(axis=1)
+
+        dsidtk = c * u[:, None] ** 2 * wt[None, :] / (tau[None, :] - u[:, None]) ** 2 * (mldm[:, None] + tu[:, None] / mldmp[:, None])
+
+        dxiidtk = (1 - sin2[:, None]) * dsidtk[i_idx, :] + sin2[:, None] * dsidtk[i_idx + 1, :]
+
+        integral2 = c * (wt[None, :] * tau[None, :] ** 2 / (tau[None, :] * X[:, None] + 1) ** 2).sum(axis=1)
+        dhatGammaidtk = c * wt[None, :] / (tau[None, :] * X[:, None] + 1) ** 2 * integral1[:, None]
+        dhatGammaidXi = 1 - integral2 * integral1
         dhatGammaidxii = -integral3
-        dhatXidtk = - dhatGammaidtk/dhatGammaidXi[:,None]
-        dXidxii = - dhatGammaidxii/dhatGammaidXi
-        dXidtk = dhatXidtk + dXidxii[:,None]*dxiidtk
-        
+        dhatXidtk = -dhatGammaidtk / dhatGammaidXi[:, None]
+        dXidxii = -dhatGammaidxii / dhatGammaidXi
+        dXidtk = dhatXidtk + dXidxii[:, None] * dxiidtk
+
         dXidtk[torch.logical_not(torch.isfinite(dXidtk))] = 0
-        
-        integral4 = (tau[None,:]*wt[None,:]/(tau[None,:]*X[:,None]+1)**2).sum(axis=1)
-        integral5 = (wt[None,:]/(tau[None,:]*X[:,None]+1)).sum(axis=1)
-        dtildefidXi = integral4/xi
-        dtildefidxii = integral5/xi**2
-        dtildefidtk = wt[None,:]*X[:,None]/(tau[None,:]*X[:,None]+1)**2/xi[:,None]
-        dfidtk = (dtildefidXi[:,None]*dXidtk + dtildefidxii[:,None]*dxiidtk + dtildefidtk).imag/np.pi
-        
+
+        integral4 = (tau[None, :] * wt[None, :] / (tau[None, :] * X[:, None] + 1) ** 2).sum(axis=1)
+        integral5 = (wt[None, :] / (tau[None, :] * X[:, None] + 1)).sum(axis=1)
+        dtildefidXi = integral4 / xi
+        dtildefidxii = integral5 / xi**2
+        dtildefidtk = wt[None, :] * X[:, None] / (tau[None, :] * X[:, None] + 1) ** 2 / xi[:, None]
+        dfidtk = (dtildefidXi[:, None] * dXidtk + dtildefidxii[:, None] * dxiidtk + dtildefidtk).imag / np.pi
+
         dfidtk[torch.logical_not(torch.isfinite(dfidtk))] = 0
-        
+
         dGidtk = torch.zeros(dxiidtk.shape, dtype=dxiidtk.dtype)
         dFidtk = torch.zeros(dxiidtk.shape, dtype=dxiidtk.dtype)
         for i in range(nu):
-            j = torch.ones(omegai[i]+1, dtype=int).cumsum(0)
-            offset = omegai[:i].sum(axis=0) + 2*i
-            dGidtk[j+offset] =  1/2*((dxiidtk[j+offset,:] - dxiidtk[j-1+offset,:])*(f[j+offset,None] + f[j-1+offset,None])).cumsum(axis=0) + 1/2*((xi[j+offset,None] - xi[j-1+offset,None])*(dfidtk[j+offset,:] + dfidtk[j-1+offset,:])).cumsum(axis=0)
+            j = torch.ones(omegai[i] + 1, dtype=int).cumsum(0)
+            offset = omegai[:i].sum(axis=0) + 2 * i
+            dGidtk[j + offset] = 1 / 2 * (
+                (dxiidtk[j + offset, :] - dxiidtk[j - 1 + offset, :]) * (f[j + offset, None] + f[j - 1 + offset, None])
+            ).cumsum(axis=0) + 1 / 2 * (
+                (xi[j + offset, None] - xi[j - 1 + offset, None]) * (dfidtk[j + offset, :] + dfidtk[j - 1 + offset, :])
+            ).cumsum(axis=0)
             if tildeomegai.sum(axis=0) > 0:
-                if (G[offset+j][-1] - F[offset]).to(float) > 0:
-                    dFidtk[j+offset] = tildeomegai[i]*(1-F[0])/(G[offset+j[-1]] - F[offset])*dGidtk[j+offset,:] - tildeomegai[i]*(1-F[0])/(G[offset+j[-1]] - F[offset])**2*(G[offset+j,None] - F[offset])*dGidtk[offset+j[-1:],:]
+                if (G[offset + j][-1] - F[offset]).to(float) > 0:
+                    dFidtk[j + offset] = (
+                        tildeomegai[i] * (1 - F[0]) / (G[offset + j[-1]] - F[offset]) * dGidtk[j + offset, :]
+                        - tildeomegai[i]
+                        * (1 - F[0])
+                        / (G[offset + j[-1]] - F[offset]) ** 2
+                        * (G[offset + j, None] - F[offset])
+                        * dGidtk[offset + j[-1:], :]
+                    )
                 else:
-                    dFidtk[j+offset] = 0
-                dFidtk[j[-1]+offset] = 0
+                    dFidtk[j + offset] = 0
+                dFidtk[j[-1] + offset] = 0
             else:
-                dFidtk[j+offset] = dGidtk[j+offset]
+                dFidtk[j + offset] = dGidtk[j + offset]
         if tildeomegai.sum(axis=0) == 0:
-            dFidtk = dGidtk/G[-1] - G[:,None]/G[-1]**2*dGidtk[-1:,:]
-        
-        domegaidtk = torch.zeros((omegai.shape[0]+1, wt.shape[0]))
+            dFidtk = dGidtk / G[-1] - G[:, None] / G[-1] ** 2 * dGidtk[-1:, :]
+
+        domegaidtk = torch.zeros((omegai.shape[0] + 1, wt.shape[0]))
         doutidtk = torch.concatenate([dfidtk, dFidtk, dxiidtk, domegaidtk], axis=0)
-        
-        return grad_output[:,None] * doutidtk, None, None, None, None, None, None, None, None, None, None
 
-class WeSpeR_MD_model(torch.nn.Module):
-    def __init__(self, tau_init, wt = None, d = torch.ones(1), wd = torch.ones(1), c = 0.1, mu = 0.1, weights = 'test', w_args = None, omega = 100, method = 'root', verbose = True):
-        """
-            Inputs:
-                tau_init: float tensor of shape (p), initial guess of population spectrum
-                d: float tensor of sahpe (n), weight vector (the diagonal of the weight matrix)
-        """
-        super().__init__()
-        self.tau_mean = tau_init.clone().mean(axis=0)
-        self.logtau = torch.nn.Parameter(torch.log(tau_init.clone()/self.tau_mean).type(torch.float64))
-        self.wt = wt
-        self.d = d
-        self.wd = wd
-        self.c = c
-        self.mu = mu
-        self.weights = weights
-        self.w_args = w_args
-        self.omega = omega
-        self.method = method
-        self.verbose = verbose
-    
-    def get_tau(self):
-        return torch.exp(self.logtau)*self.tau_mean
-        
-    def forward(self):
-        """
-            Inputs:
-            Outputs:
-                
-        """    
-        F = f_xi.apply
-        idx = torch.argsort(self.logtau)
-        if self.wt is None:
-            output = F(torch.exp(self.logtau[idx])*self.tau_mean, self.wt, self.d, self.wd, self.c, self.mu,self.weights, self.w_args, self.omega, self.method, self.verbose) 
-        else:
-            output = F(torch.exp(self.logtau[idx])*self.tau_mean, self.wt[idx], self.d, self.wd, self.c, self.mu,self.weights, self.w_args, self.omega, self.method, self.verbose) 
-        return output
-
-
-def loss_wasserstein_1D_cdf(p=2, regu1 = 1, regu2 = 1):
-    def loss_wasserstein_p(u_values, v_values, u_cumul = None, v_cumul = None):
-        # Inspired from Scipy 1D Wasserstein distance: https://github.com/scipy/scipy/blob/v1.11.4/scipy/stats/_stats_py.py#L9733-L9807https://github.com/scipy/scipy/blob/v1.11.4/scipy/stats/_stats_py.py#L9733-L9807
-        
-        if u_cumul is None:
-            u_cumul = torch.ones(u_values.shape).cumsum(axis=0)-1
-            u_cumul = u_cumul / u_cumul[-1]
-        if v_cumul is None:
-            v_cumul = torch.ones(v_values.shape).cumsum(axis=0)-1
-            v_cumul = v_cumul / v_cumul[-1]
-        
-        u_weights = torch.diff(torch.cat((u_cumul[:1],u_cumul)))
-        v_weights = torch.diff(torch.cat((v_cumul[:1],v_cumul)))
-        
-        u_sorter = torch.argsort(u_values, axis=0)
-        v_sorter = torch.argsort(v_values, axis=0)
-        
-        all_values = torch.cat((u_values, v_values), axis=0)
-        all_values = all_values.sort(axis=0)[0]
-        
-        # Compute the differences between pairs of successive values of u and v.
-        deltas = torch.diff(all_values, axis=0)
-        
-        # Get the respective positions of the values of u and v among the values of both distributions.
-        u_values_sort = u_values[u_sorter].contiguous()
-        v_values_sort = v_values[v_sorter].contiguous()
-        
-        u_cdf_indices = torch.searchsorted(all_values[:-1].contiguous(), u_values_sort, right = True)
-        v_cdf_indices = torch.searchsorted(all_values[:-1].contiguous(), v_values_sort, right = True)
-        
-        # Calculate the CDFs of u and v using their weights, if specified.
-        u_cdf = torch.zeros(all_values.shape, dtype=torch.float)
-        v_cdf = torch.zeros(all_values.shape, dtype=torch.float)
-        
-        u_cdf[u_cdf_indices] = u_weights[u_sorter].to(torch.float)
-        u_cdf = u_cdf.cumsum(axis=0)
-        
-        v_cdf[v_cdf_indices] = v_weights[v_sorter].to(torch.float)
-        v_cdf = v_cdf.cumsum(axis=0)
-        
-        
-        # We do not normalize the power by 1/p at the end, to make it differentiable
-        distance1 = ((torch.abs(u_cdf - v_cdf)[:-1]**p * deltas)).sum(axis=0)
-        
-        distance2 = regu1*((u_values*u_weights).sum(axis=0) - (v_values*v_weights).sum(axis=0))**2 
-        
-        if u_values.shape[0] > 1:
-            u_max = torch.max(u_values[u_weights > 0])
-            u_min = torch.min(u_values[u_weights > 0])
-            q_max = u_cumul[-2]
-            q_min = u_cumul[2]
-            v_max_idx = v_cumul >= q_max
-            v_min_idx = v_cumul <= q_min
-            v_max = torch.max(v_values[v_weights > 0])
-            v_min = torch.min(v_values[v_weights > 0])
-            # if v_values[v_max_idx].shape[0] > 0:
-            #     v_max = v_values[v_max_idx].mean()
-            # else:
-            #     v_max = v_values[-1]
-            # if v_values[v_min_idx].shape[0] > 0:
-            #     v_min = v_values[v_min_idx].mean()
-            # else:
-            #     v_min = v_values[0]
-            
-            distance3 = regu2*((v_min - u_min)**2 + (v_max - u_max)**2)
-        else:
-            distance3 = 0
-        return (distance1 + distance2 + distance3).mean()
-    
-    return loss_wasserstein_p
-
-def loss_LW(regu1 = 0., regu2 = 0.):
-    def loss_fn(lambda_, F, xi, c, omegai):
-        
-        
-        p = lambda_.shape[0]
-        n = int(p/c)
-        lambda_k = torch.zeros(p)
-        X_k = 0
-        X_kp = 0
-        
-        idx = torch.ones(F.shape[0], dtype=int).cumsum(axis=0) - 1
-        omegai_cum = omegai.cumsum(axis=0)
-        for kappa in range(max(p-n,0), p):
-            kappap = kappa + 1
-            
-            j_idx = idx[torch.logical_and(F >= kappa/p, F < kappap/p)]
-            
-            if j_idx.shape[0] == 0:
-                j_kp = max(torch.argmax(((kappap - p*F) < 0).to(int)) - 1, 0)
-                j_k = max(torch.argmax(((kappap - p*F) < 0).to(int)) - 1, 0)
-                i = torch.argmax(((j_k - omegai_cum) < 0).to(int))                
-                ip = torch.argmax(((j_kp - omegai_cum) < 0).to(int))
-                delta1 = (kappap/p - F[j_kp])*xi[j_kp] + (kappap/p - F[j_kp])**2/2/(F[j_kp+1] - F[j_kp])*(xi[j_kp+1] - xi[j_kp])
-                delta2 =  -(kappa/p - F[j_k])*xi[j_k] - (kappa/p - F[j_k])**2/2/(F[j_k+1] - F[j_k])*(xi[j_k+1] - xi[j_k])
-                delta3 = torch.zeros(1)
-                
-            else:
-                j_kp = j_idx[-1]
-                ip = torch.argmax(((j_kp - omegai_cum) < 0).to(int))
-            
-                j_k = j_idx[0]
-                i = torch.argmax(((j_k - omegai_cum) < 0).to(int))
-            
-                if j_kp+1 < F.shape[0] and F[j_kp+1] - F[j_kp] > 0:
-                    delta1 = (kappap/p - F[j_kp])*xi[j_kp] + (kappap/p - F[j_kp])**2/2/(F[j_kp+1] - F[j_kp])*(xi[j_kp+1] - xi[j_kp])
-                else:
-                    delta1 = torch.zeros(1)
-                    
-                if j_k-1 >= 0 and F[j_k] - F[j_k-1] > 0:
-                    delta2 = (F[j_k] - kappa/p)*xi[j_k] - (F[j_k] - kappa/p)**2/2/(F[j_k] - F[j_k-1])*(xi[j_k] - xi[j_k-1])
-                else:
-                    delta2 = torch.zeros(1)
-                
-                if j_kp > j_k:
-                    l = torch.ones(j_kp - j_k, dtype=int).cumsum(axis=0) - 1 + j_k
-                    delta3 = ((F[l+1] - F[l])*(xi[l+1] + xi[l])/2).sum(axis=0)
-                else:
-                    delta3 = torch.zeros(1)
-                
-                    
-            
-            X_k = X_kp
-            X_kp = X_k + delta1 + delta2 + delta3
-            
-            if kappa > 0:        
-                X_kp = max(X_k + lambda_k[kappa-1]/p, X_kp)
-            lambda_k[kappa] = (X_kp - X_k)*p
-            
-            if i != ip:
-                j = torch.argmin((lambda_k[kappa] - xi)**2)
-                lambda_k[kappa] = xi[j]
-            
-        # first penalization on the mean
-        pen1 = regu1*(lambda_.mean(axis=0) - lambda_k.mean(axis=0))**2
-        # second penalization on the extremums
-        idx = torch.ones(lambda_.shape, dtype=int).cumsum(axis=0)-1
-        weights = torch.cos(idx*np.pi/idx[-1])**2
-        pen2 = regu2*(weights*(lambda_ - lambda_k)**2).mean()
-            
-            
-        return (((lambda_ - lambda_k)**2).mean() + pen1 + pen2)/(1 + regu1 + regu2)
-    return loss_fn
-
-def loss_LWO():
-    def loss_fn(lambda_, F, xi, c):
-        p = lambda_.shape[0]
-        n = int(p/c)
-        lambda_k = torch.zeros(p)
-        for kappa in range(max(p-n,0), p):
-            j_k = max(torch.argmax((((kappa+1/2) - p*F) < 0).to(int)) - 1, 0)
-            j_kp = max(torch.argmax((((kappa+1/2) - p*F) < 0).to(int)), 0)
-            if F[j_kp] - F[j_k] > 0:
-                lambda_k[kappa] = (((kappa+1/2)/p - F[j_k])*xi[j_k] + (F[j_kp] - (kappa+1/2)/p)*xi[j_kp])/(F[j_kp] - F[j_k])
-            else:
-                lambda_k[kappa] = (xi[j_k]+xi[j_kp])/2
-        
-        return ((lambda_ - lambda_k)**2).mean()
-    return loss_fn
-
-def WeSpeR_MD_minimization(lambda_, tau_init, wt = None, d = torch.ones(1), wd = torch.ones(1), c = 0.1, mu = 0.1, weights = 'test', w_args = None, omega = 100, lr = 1e-2, n_epochs = 100, decay = 1., loss_type="w2", method = 'root', save_all_tau = False, verbose = True, plot_loss = False):   
-    model = WeSpeR_MD_model(tau_init, wt = wt, d = d, wd = wd, c =c, mu = mu, weights = weights, w_args = w_args, omega = omega, method = method, verbose = False)
-    if loss_type == "w2":
-        loss_fn = loss_wasserstein_1D_cdf(p=2, regu1=0.1, regu2=0.1) # we can also use loss_composite(p=2, regu=1)
-    elif loss_type == "trap":
-        loss_fn = loss_LW(regu1=0.1, regu2=1.)
-    elif loss_type == "euler":
-        loss_fn = loss_LWO()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay)
-    
-    # Train loop
-    if save_all_tau:
-        all_tau = [model.get_tau().detach()]
-    else:
-        all_tau = []
-    running_loss = []
-    best_loss = np.inf
-    best_tau = tau_init.type(torch.float64)
-    
-    eps = 1e-5
-    
-    model.train(True)
-    for i in range(n_epochs):
-        optimizer.zero_grad()
-        output = model()
-            
-        nu = output[-1].to(int)
-        omegai = output[-nu-1:-1].to(int)
-        output = output[:-nu-1]
-        f = output[:output.shape[0]//3]
-        F = output[output.shape[0]//3:2*output.shape[0]//3]
-        xi = output[2*output.shape[0]//3:]
-        u_cumul = None
-        v_cumul = F
-        if loss_type == "w2":
-            loss = loss_fn(torch.cat([torch.zeros(1),lambda_]), xi, u_cumul, v_cumul)
-        elif loss_type == "trap":
-            loss = loss_fn(lambda_, F, xi, c, omegai)
-        elif loss_type == "euler":
-            loss = loss_fn(lambda_, F, xi, c)
-        loss.backward()
-            
-        optimizer.step()
-        scheduler.step()        
-        
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            best_tau = model.get_tau().clone()
-        
-        if save_all_tau:
-            all_tau += [model.get_tau().detach()]
-        running_loss += [loss.item()]
-        if verbose:
-            if n_epochs < 11 or i % min((n_epochs // 10),10) == 0:
-                print("Loss epoch", i, ":", loss.item())
-        
-    if plot_loss:
-        print("Final loss :", best_loss)
-        plt.figure()
-        plt.semilogy(np.array(running_loss))
-        plt.title("Running loss in function of epochs")
-        plt.xlabel("epochs")
-        plt.ylabel("training loss")
-        plt.show()
-    
-    return model, best_tau, np.array(running_loss), all_tau
-
-
-def m_idx(K, d):
-    M = d.shape[0]
-    if K is None or K <= 0:
-        return list(range(1,M+1))
-    d_diff = torch.diff(d, axis=0)
-    d_idx = torch.argsort(d_diff, axis=0)
-    if K >= 2:
-        rst = (d_idx[-K+1:]+1).tolist() + [M]
-    else:
-        rst = [M]
-    return rst
-
+        return (grad_output[:, None] * doutidtk,) + (None,) * 10

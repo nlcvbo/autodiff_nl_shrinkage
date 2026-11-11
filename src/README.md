@@ -1,5 +1,79 @@
-Implementation of WeSpeR algorithm.
+# autodiff non-linear shrinkage
 
-* For the implementation and the experiments on the on WeSpeR, run the file WeSpeR.py
+Non-linear shrinkage estimation of covariance and precision matrices for
+**weighted** samples, where the population spectrum is identified by automatic
+differentiation: simulated sample spectra are matched to the observed one by
+gradient descent (PyTorch), and the fitted population spectrum is then plugged
+into the non-linear shrinkage formulas.
 
-* For the experiments on the spectrum identification, run the file support_experiment.py
+## Installation
+
+The project uses [uv](https://docs.astral.sh/uv/) and requires Python >= 3.12.
+
+```bash
+uv sync
+```
+
+## Quick start
+
+```python
+import numpy as np
+import torch
+
+from autodiff import Autodiff
+from main import make_weight_distribution, make_weights
+
+p, n = 100, 1000
+tau_pop = np.array([1.0] * 20 + [3.0] * 40 + [10.0] * 40)
+
+# Exponentially decaying sample weights
+d, wd = make_weight_distribution()
+W = make_weights("ewma", n, 5.0, d, wd)
+
+X = np.random.normal(size=(n, p)) * np.sqrt(tau_pop)
+S = X.T @ (W[:, None] * X) / n
+
+estimator = Autodiff(bias=True, assume_centered=True).fit_from_S(S, W, n_epochs=50, lr=5e-2)
+covariance = estimator.get_covariance(d=d, wd=wd, weights="ewma", w_args=[5.0, 30])
+precision = estimator.get_precision(d=d, wd=wd, weights="ewma", w_args=[5.0, 30])
+tau_hat = estimator.get_tau()  # estimated population eigenvalues
+```
+
+`weights` is one of `"ewma"` (`w_args=[alpha, Kt]`), `"unif"` (`w_args=[alpha, Kt]`)
+or `"Ndiracs"` (`w_args=[Kd, Kt]`, uses the discrete weight law `(d, wd)`).
+
+## Experiments
+
+From this directory:
+
+```bash
+uv run main.py
+```
+
+runs three experiments:
+
+1. `WeSpeR_experiment_1`: covariance and precision estimation (loss and PRIAL
+   against the sample, linear-shrinkage and oracle non-linear estimators).
+2. `WeSpeR_experiment_2`: estimation of the regression vector `Sigma^{-1} v`.
+3. `WeSpeR_experiment_3`: identification of continuous population spectra
+   `H_1` to `H_4` (Q-Q plots).
+
+## Layout
+
+| File | Content |
+| --- | --- |
+| `autodiff.py` | `Autodiff`, the scikit-learn compatible estimator |
+| `utils.py` | differentiable sampler, losses and optimisation loop |
+| `nl_formulas.py` | oracle non-linear shrinkage of covariance / precision eigenvalues |
+| `nl_utils.py` | Stieltjes transform solvers and asymptotic sample density |
+| `weighted_LWO_estimator.py` | weighted Ledoit-Wolf-type linear shrinkage |
+| `WeSpeR_support_identification_*.py` | support of the sample spectrum per weight family |
+| `WeSpeR_root_finding.py` | bracketing and root-finding helpers |
+| `main.py` | experiments |
+
+## Development
+
+```bash
+uvx ruff check .    # lint
+uvx ruff format .   # format
+```
