@@ -52,11 +52,23 @@ uv run main.py
 
 runs three experiments:
 
-1. `WeSpeR_experiment_1`: covariance and precision estimation (loss and PRIAL
+1. `experiment_1`: covariance and precision estimation (loss and PRIAL
    against the sample, linear-shrinkage and oracle non-linear estimators).
-2. `WeSpeR_experiment_2`: estimation of the regression vector `Sigma^{-1} v`.
-3. `WeSpeR_experiment_3`: identification of continuous population spectra
+2. `experiment_2`: estimation of the regression vector `Sigma^{-1} v`.
+3. `experiment_3`: identification of continuous population spectra
    `H_1` to `H_4` (Q-Q plots).
+
+```bash
+uv run main.py review [scale] [n_jobs]
+```
+
+runs instead the robustness experiments of the article (`review_experiments`):
+concentration ratio `c` near 1 and `c > 1`, singular population covariance,
+heavy tails (Student, Pareto, elliptical noise; true and retrieved spectrum),
+and spikes (outlier location and shrinkage). `scale` multiplies the numbers of
+Monte-Carlo runs (`1` reproduces the article, e.g. `0.05` for a quick check),
+`n_jobs` is the number of worker processes, and the summaries are written to
+`review_results.json`. With the default sizes the full set takes hours.
 
 ## Layout
 
@@ -67,8 +79,7 @@ runs three experiments:
 | `nl_formulas.py` | oracle non-linear shrinkage of covariance / precision eigenvalues |
 | `nl_utils.py` | Stieltjes transform solvers and asymptotic sample density |
 | `weighted_LWO_estimator.py` | weighted Ledoit-Wolf-type linear shrinkage |
-| `WeSpeR_support_identification_*.py` | support of the sample spectrum per weight family |
-| `WeSpeR_root_finding.py` | bracketing and root-finding helpers |
+| `support/` | support identification (per weight family) and root finding, only used to plot the asymptotic density |
 | `main.py` | experiments |
 
 ## Development

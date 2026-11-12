@@ -13,13 +13,13 @@ import numpy as np
 import torch
 from scipy.optimize import minimize
 
-from WeSpeR_support_identification_ewma import find_support_exp_u, mld_exp, mld_expp
-from WeSpeR_support_identification_Ndiracs import (
+from support.ewma import find_support_exp_u, mld_exp, mld_expp
+from support.ndiracs import (
     find_support_Ndiracs_u,
     mld_Ndiracs,
     mld_Ndiracsp,
 )
-from WeSpeR_support_identification_unif import find_support_unif_u, mld_unif, mld_unifp
+from support.unif import find_support_unif_u, mld_unif, mld_unifp
 
 # A solution of the fixed-point equation is accepted if its squared residual is
 # below this tolerance.
@@ -214,7 +214,7 @@ def m_X(x, weights, w_args, d, wd, c, t, wt):
     return m_X_w(x, d, wd, c, t, wt)
 
 
-def WeSpeR_support_u(tau, wtau, d, wd, c, weights, w_args, method=None, verbose=True):
+def support_u(tau, wtau, d, wd, c, weights, w_args, method=None, verbose=True):
     """Identify the support of the asymptotic sample spectrum.
 
     Parameters
@@ -267,7 +267,7 @@ def WeSpeR_support_u(tau, wtau, d, wd, c, weights, w_args, method=None, verbose=
     return torch.from_numpy(support), torch.from_numpy(u), torch.from_numpy(mldm), torch.from_numpy(tildeomegai)
 
 
-def WeSpeR_density(omega, support, d, wd, c, tau, tildeomegai, mu=0.1, wt=None, weights="test", w_args=None):
+def sample_density(omega, support, d, wd, c, tau, tildeomegai, mu=0.1, wt=None, weights="test", w_args=None):
     """Compute the asymptotic sample density and cdf on an adaptive grid.
 
     Parameters
@@ -275,7 +275,7 @@ def WeSpeR_density(omega, support, d, wd, c, tau, tildeomegai, mu=0.1, wt=None, 
     omega : int
         Total number of grid points.
     support : torch.Tensor
-        Edges of the support intervals (as returned by :func:`WeSpeR_support_u`).
+        Edges of the support intervals (as returned by :func:`support_u`).
     d, wd : torch.Tensor
         Support and probabilities of the weight distribution.
     c : float
@@ -408,7 +408,7 @@ class f_xi(torch.autograd.Function):  # noqa: N801
             Concentration ratio ``p / n``.
         mu : float
             Fraction of the grid points spread uniformly (see
-            :func:`WeSpeR_density`).
+            :func:`sample_density`).
         weights : str
             Family of the sample weights.
         w_args : list
@@ -429,11 +429,11 @@ class f_xi(torch.autograd.Function):  # noqa: N801
         if wt is None:
             wt = torch.ones(tau.shape[0]) / tau.shape[0]
 
-        support, u, mldm, tildeomegai = WeSpeR_support_u(
+        support, u, mldm, tildeomegai = support_u(
             tau.detach().numpy(), wt.numpy(), d.numpy(), wd.numpy(), c, weights, w_args, method=method, verbose=verbose
         )
 
-        xi, f, F, G, X, omegai, i_idx, j_idx, sin2, nu = WeSpeR_density(
+        xi, f, F, G, X, omegai, i_idx, j_idx, sin2, nu = sample_density(
             omega, support, d, wd, c, tau, tildeomegai, mu=mu, wt=wt, weights=weights, w_args=w_args
         )
 

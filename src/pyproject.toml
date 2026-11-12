@@ -25,7 +25,6 @@ exclude = [".venv"]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "N", "RUF"]
 ignore = [
     "N802", "N803", "N806",  # mathematical notation: S, W, X, U, ... are conventional
-    "N999",                  # module names follow the WeSpeR naming
     "SIM108",                # long ternaries are less readable than if/else
     "RUF002", "RUF003",      # keep unicode in comments
 ]

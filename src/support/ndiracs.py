@@ -7,7 +7,7 @@ The sample weights follow a discrete law with atoms ``d`` and probabilities
 import numpy as np
 from numpy.polynomial import polynomial as poly
 
-from WeSpeR_root_finding import m_idx_tab, root_brentq_l, root_brentq_lm, root_brentq_m, root_brentq_p, root_brentq_r
+from .root_finding import m_idx_tab, root_brentq_l, root_brentq_lm, root_brentq_m, root_brentq_p, root_brentq_r
 
 
 def mld_Ndiracs(x, wd, d):

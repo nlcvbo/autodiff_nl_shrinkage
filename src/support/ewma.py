@@ -1,56 +1,42 @@
-"""Support identification of the sample spectrum for linearly weighted samples.
+"""Support identification of the sample spectrum for exponentially weighted samples.
 
-The weights are uniformly distributed on ``[1 - alpha / 2, 1 + alpha / 2]``.
+The weights are ``W_i = beta * exp(-alpha * i / n)`` with ``beta = alpha / (1 - exp(-alpha))``.
 """
 
 import numpy as np
-from scipy.optimize import root_scalar
 
-from WeSpeR_root_finding import m_idx_tab, root_brentq_l, root_brentq_m, root_brentq_p, root_brentq_r
+from .root_finding import m_idx_tab, root_brentq_l, root_brentq_m, root_brentq_p, root_brentq_r
 
 
-def mld_unif(x, alpha):
+def mld_exp(x, alpha):
     """Transform ``E[W / (W - x)]`` of the limiting weight distribution."""
-    return 1 + x / alpha * np.log(1 + alpha / (1 - alpha / 2 - x))
+    beta = alpha / (1 - np.exp(-alpha))
+    rst = 1 / alpha * np.log(1 + alpha / (beta * np.exp(-alpha) - x))
+    return rst
 
 
-def mld_unifp(x, alpha):
-    """First derivative of :func:`mld_unif`."""
-    return np.log(1 + alpha / (1 - alpha / 2 - x)) / alpha + x / ((1 - alpha / 2 - x) ** 2 + alpha * (1 - alpha / 2 - x))
+def mld_expp(x, alpha):
+    """First derivative of :func:`mld_exp`."""
+    beta = alpha / (1 - np.exp(-alpha))
+    return 1 / ((beta * np.exp(-alpha) - x) ** 2 + alpha * (beta * np.exp(-alpha) - x))
 
 
-def mld_unifpp(x, alpha):
-    """Second derivative of :func:`mld_unif`."""
-    return (
-        2 / ((1 - alpha / 2 - x) ** 2 + alpha * (1 - alpha / 2 - x))
-        - 2 * x * (x - 1) / ((1 - alpha / 2 - x) ** 2 + alpha * (1 - alpha / 2 - x)) ** 2
-    )
+def mld_exppp(x, alpha):
+    """Second derivative of :func:`mld_exp`."""
+    beta = alpha / (1 - np.exp(-alpha))
+    return +(2 * (beta * np.exp(-alpha) - x) + alpha) / ((beta * np.exp(-alpha) - x) ** 2 + alpha * (beta * np.exp(-alpha) - x)) ** 2
 
 
-def _solve_mldm(g1, alpha):
-    """Solve ``mld_unif(m, alpha) = g1`` for ``m`` with Newton's method.
-
-    The starting point is the solution for two Diracs at ``1 -/+ alpha / 2``.
-    """
-    alpha_d = alpha / 2
-    m_init = 1 - 1 / 2 / g1 - np.sqrt(1 + 4 * g1 * (g1 - 1) * alpha_d**2) / 2 / g1
-    return root_scalar(
-        lambda x: mld_unif(x, alpha) - g1,
-        x0=m_init,
-        fprime=lambda x: mld_unifp(x, alpha),
-        method="newton",
-    ).root
-
-
-def x_unif(w, t, alpha, c):
+def x_exp(w, t, alpha, c):
     """Return the function ``u -> x_k(u)`` whose critical values are the edges of the support.
 
     With ``return_m=True`` the returned function also returns ``m(u)``.
     """
 
     def xk(u, return_m=False):
+        beta = alpha / (1 - np.exp(-alpha))
         g1 = c * (w * t / (t - u)).sum()
-        m = _solve_mldm(g1, alpha)
+        m = beta * np.exp(-alpha) + alpha / (1 - np.exp(alpha * g1))
 
         rst = -u * g1 * m
         if return_m:
@@ -60,17 +46,18 @@ def x_unif(w, t, alpha, c):
     return xk
 
 
-def x_unif_p(w, t, alpha, c):
+def x_exp_p(w, t, alpha, c):
     """Return the first derivative of ``u -> x_k(u)``."""
 
     def xkp(u):
+        beta = alpha / (1 - np.exp(-alpha))
         g1 = c * (w * t / (t - u)).sum()
-        m = _solve_mldm(g1, alpha)
+        m = beta * np.exp(-alpha) + alpha / (1 - np.exp(alpha * g1))
 
         tw = c * (w * t / (t - u)).sum()
         twp = c * (w * t / (t - u) ** 2).sum()
         v = m
-        vp = twp / mld_unifp(m, alpha)
+        vp = twp / mld_expp(m, alpha)
 
         rst = -tw * v - u * twp * v - u * tw * vp
         return rst
@@ -78,19 +65,20 @@ def x_unif_p(w, t, alpha, c):
     return xkp
 
 
-def x_unif_pp(w, t, alpha, c):
+def x_exp_pp(w, t, alpha, c):
     """Return the second derivative of ``u -> x_k(u)``."""
 
     def xkpp(u):
+        beta = alpha / (1 - np.exp(-alpha))
         g1 = c * (w * t / (t - u)).sum()
-        m = _solve_mldm(g1, alpha)
+        m = beta * np.exp(-alpha) + alpha / (1 - np.exp(alpha * g1))
 
         tw = c * (w * t / (t - u)).sum()
         twp = c * (w * t / (t - u) ** 2).sum()
         twpp = 2 * c * (w * t / (t - u) ** 3).sum()
         v = m
-        vp = twp / mld_unifp(m, alpha)
-        vpp = twpp / mld_unifp(m, alpha) - twp**2 * mld_unifpp(m, alpha) / mld_unifp(m, alpha) ** 3
+        vp = twp / mld_expp(m, alpha)
+        vpp = twpp / mld_expp(m, alpha) - twp**2 * mld_exppp(m, alpha) / mld_expp(m, alpha) ** 3
 
         rst = -twp * v - tw * vp - twp * v - u * twpp * v - u * twp * vp - tw * vp - u * twp * vp - u * tw * vpp
         return rst
@@ -146,7 +134,7 @@ def vppp(u, k, w, t, d, wd, c, m):  # see p.135
     )
 
 
-def find_support_unif(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=False):
+def find_support_exp(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=False):
     """Return the edges of the support of the sample spectrum.
 
     Parameters
@@ -154,7 +142,7 @@ def find_support_unif(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=Fals
     c : float
         Concentration ratio ``p / n``.
     alpha : float
-        Spread of the weights, in ``[0, 2]``.
+        Decay rate of the weights.
     t, w : ndarray
         Atoms of the population spectrum (sorted) and their probabilities.
     Kt : int, default=-1
@@ -171,16 +159,15 @@ def find_support_unif(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=Fals
     support : ndarray
         Sorted edges ``[l_1, r_1, l_2, r_2, ...]`` of the support intervals.
     """
-    # eps >= 1e-1 necessary
     support = []
 
     t_idx = m_idx_tab(Kt, t)
     t_idx = [i - 1 for i in t_idx]
 
     for i in t_idx[:-1]:
-        xkpp = x_unif_pp(w, t, alpha, c)
-        xkp = x_unif_p(w, t, alpha, c)
-        xk = x_unif(w, t, alpha, c)
+        xkpp = x_exp_pp(w, t, alpha, c)
+        xkp = x_exp_p(w, t, alpha, c)
+        xk = x_exp(w, t, alpha, c)
 
         try:
             u0 = root_brentq_p(xkpp, t[i], t[i + 1], eps)
@@ -206,8 +193,8 @@ def find_support_unif(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=Fals
 
     # for the left exterior intervals, ]-infty,tau0[ -> in fact it is ]0, tau0[, for k == M if c<1
     if c < 1:
-        xkp = x_unif_p(w, t, alpha, c)
-        xk = x_unif(w, t, alpha, c)
+        xkp = x_exp_p(w, t, alpha, c)
+        xk = x_exp(w, t, alpha, c)
         try:
             u0 = root_brentq_p(xkp, 0, t[0], eps)
             xk0 = xk(u0)
@@ -218,24 +205,24 @@ def find_support_unif(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=Fals
             if verbose:
                 print("Error", 0, t[0])
     else:
-        xkpp = x_unif_pp(w, t, alpha, c)
-        xkp = x_unif_p(w, t, alpha, c)
-        xk = x_unif(w, t, alpha, c)
+        xkpp = x_exp_pp(w, t, alpha, c)
+        xkp = x_exp_p(w, t, alpha, c)
+        xk = x_exp(w, t, alpha, c)
 
-        try:
-            u0 = root_brentq_l(xkp, 0, t[0], eps)
-            xk0 = xk(u0)
-            support += [0, xk0]
-            if verbose:
-                print(u0, xk(u0), xkp(u0))
-        except ValueError:
-            if verbose:
-                print("Error:", -np.inf, t[0])
+    try:
+        u0 = root_brentq_l(xkp, 0, t[0], eps)
+        xk0 = xk(u0)
+        support += [0, xk0]
+        if verbose:
+            print(u0, xk(u0), xkp(u0))
+    except ValueError:
+        if verbose:
+            print("Error:", -np.inf, t[0])
 
     # for the right exterior intervals, ]tau_p,infty[, for k == M
-    xkpp = x_unif_pp(w, t, alpha, c)
-    xkp = x_unif_p(w, t, alpha, c)
-    xk = x_unif(w, t, alpha, c)
+    xkpp = x_exp_pp(w, t, alpha, c)
+    xkp = x_exp_p(w, t, alpha, c)
+    xk = x_exp(w, t, alpha, c)
 
     try:
         u0 = root_brentq_r(xkp, t[-1], t[-1] + 1, eps)
@@ -247,14 +234,15 @@ def find_support_unif(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=Fals
             print("Error:", t[-1], np.inf)
 
     support.sort()
-    support = support[:-1]
-    if support.shape[0] % 2 != 0:
-        support = np.concatenate([support, [t[-1] * (1 + alpha / 2) * (1 + np.sqrt(c)) ** 2]])
+    support = support[1:]
 
+    if support.shape[0] % 2 != 0:
+        beta = alpha / (1 - np.exp(-alpha))
+        support = np.concatenate([support, [t[-1] * beta * (1 + np.sqrt(c)) ** 2]])
     return support
 
 
-def find_support_unif_u(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=False):
+def find_support_exp_u(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=False):
     """Return the support of the sample spectrum with the matching points ``u``.
 
     Parameters
@@ -262,7 +250,7 @@ def find_support_unif_u(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=Fa
     c : float
         Concentration ratio ``p / n``.
     alpha : float
-        Spread of the weights, in ``[0, 2]``.
+        Decay rate of the weights.
     t, w : ndarray
         Atoms of the population spectrum (sorted) and their probabilities.
     Kt : int, default=-1
@@ -285,7 +273,6 @@ def find_support_unif_u(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=Fa
     tildeomegai : ndarray
         Mass of each support interval.
     """
-    # eps >= 1e-1 necessary
     support = []
     u = []
     mldm = []
@@ -295,9 +282,9 @@ def find_support_unif_u(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=Fa
     t_idx = [i - 1 for i in t_idx]
 
     for i in t_idx[:-1]:
-        xkpp = x_unif_pp(w, t, alpha, c)
-        xkp = x_unif_p(w, t, alpha, c)
-        xk = x_unif(w, t, alpha, c)
+        xkpp = x_exp_pp(w, t, alpha, c)
+        xkp = x_exp_p(w, t, alpha, c)
+        xk = x_exp(w, t, alpha, c)
 
         try:
             u0 = root_brentq_p(xkpp, t[i], t[i + 1], eps)
@@ -330,8 +317,8 @@ def find_support_unif_u(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=Fa
 
     # for the left exterior intervals, ]-infty,tau0[ -> in fact it is ]0, tau0[, for k == M if c<1
     if c < 1:
-        xkp = x_unif_p(w, t, alpha, c)
-        xk = x_unif(w, t, alpha, c)
+        xkp = x_exp_p(w, t, alpha, c)
+        xk = x_exp(w, t, alpha, c)
         try:
             u0 = root_brentq_p(xkp, 0, t[0], eps)
             xk0, m0 = xk(u0, return_m=True)
@@ -344,9 +331,9 @@ def find_support_unif_u(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=Fa
             if verbose:
                 print("Error", 0, t[0])
     else:
-        xkpp = x_unif_pp(w, t, alpha, c)
-        xkp = x_unif_p(w, t, alpha, c)
-        xk = x_unif(w, t, alpha, c)
+        xkpp = x_exp_pp(w, t, alpha, c)
+        xkp = x_exp_p(w, t, alpha, c)
+        xk = x_exp(w, t, alpha, c)
 
         try:
             u0 = root_brentq_l(xkp, 0, t[0], eps)
@@ -361,9 +348,9 @@ def find_support_unif_u(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=Fa
                 print("Error:", -np.inf, t[0])
 
     # for the right exterior intervals, ]tau_p,infty[, for k == M
-    xkpp = x_unif_pp(w, t, alpha, c)
-    xkp = x_unif_p(w, t, alpha, c)
-    xk = x_unif(w, t, alpha, c)
+    xkpp = x_exp_pp(w, t, alpha, c)
+    xkp = x_exp_p(w, t, alpha, c)
+    xk = x_exp(w, t, alpha, c)
 
     try:
         u0 = root_brentq_r(xkp, t[-1], t[-1] + 1, eps)
@@ -377,23 +364,29 @@ def find_support_unif_u(c, alpha, t, w, Kt=-1, eps=1e-1, method=None, verbose=Fa
         if verbose:
             print("Error:", t[-1], np.inf)
 
-    support, u, mldm = map(list, zip(*sorted(zip(support, u, mldm, strict=True)), strict=True))
+    if len(support) != 0:
+        support, u, mldm = map(list, zip(*sorted(zip(support, u, mldm, strict=True)), strict=True))
 
-    support = np.array(support[1:])
-    u = np.array(u[1:])
-    mldm = np.array(mldm[1:])
+        support = np.array(support[1:])
+        u = np.array(u[1:])
+        mldm = np.array(mldm[1:])
 
-    if support.shape[0] % 2 != 0:
-        support = np.concatenate([support, [t[-1] * (1 + alpha / 2) * (1 + np.sqrt(c)) ** 2]])
-        u = np.concatenate([u, [t[-1] + 1]])
-        mldm = np.concatenate([mldm, [(1 + alpha / 2) + 1]])
+        if support.shape[0] % 2 != 0:
+            beta = alpha / (1 - np.exp(-alpha))
+            support = np.concatenate([support, [t[-1] * beta * (1 + np.sqrt(c)) ** 2]])
+            u = np.concatenate([u, [t[-1] + 1]])
+            mldm = np.concatenate([mldm, [beta + 1]])
+
+            nu = support.shape[0] // 2
+            tildeomegai = np.ones(nu) / nu
+            return support, u, mldm, tildeomegai
 
         nu = support.shape[0] // 2
-        tildeomegai = np.ones(nu) / nu
+        tildeomegai = np.ones(nu)
+        for i in range(nu):
+            tildeomegai[i] = w[(t > u[2 * i]) & (t < u[2 * i + 1])].sum()
+        if tildeomegai.sum() > 0:
+            tildeomegai = tildeomegai / tildeomegai.sum()
         return support, u, mldm, tildeomegai
-
-    nu = support.shape[0] // 2
-    tildeomegai = np.ones(nu)
-    for i in range(nu):
-        tildeomegai[i] = w[(t > u[2 * i]) & (t < u[2 * i + 1])].sum()
-    return support, u, mldm, tildeomegai
+    else:
+        return np.zeros(0), np.zeros(0), np.zeros(0), np.zeros(0)
