@@ -1,10 +1,12 @@
 # autodiff non-linear shrinkage
 
+The code is linked to the article [Asymptotic non-linear shrinkage and eigenvector overlap for weighted sample covariance](https://arxiv.org/abs/2410.14420).
+
 Non-linear shrinkage estimation of covariance and precision matrices for
 **weighted** samples, where the population spectrum is identified by automatic
 differentiation: simulated sample spectra are matched to the observed one by
 gradient descent (PyTorch), and the fitted population spectrum is then plugged
-into the non-linear shrinkage formulas.
+into the non-linear shrinkage formulas. 
 
 ## Installation
 
