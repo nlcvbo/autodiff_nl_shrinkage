@@ -23,7 +23,7 @@ import numpy as np
 import torch
 
 from autodiff import Autodiff
-from main import make_weight_distribution, make_weights
+from utils import make_weight_distribution, make_weights
 
 p, n = 100, 1000
 tau_pop = np.array([1.0] * 20 + [3.0] * 40 + [10.0] * 40)
@@ -46,43 +46,44 @@ or `"Ndiracs"` (`w_args=[Kd, Kt]`, uses the discrete weight law `(d, wd)`).
 
 ## Experiments
 
-From this directory:
+From the `src` directory:
 
 ```bash
-uv run main.py
+uv run main.py [scale] [n_jobs]
 ```
 
-runs three experiments:
-
-1. `experiment_1`: covariance and precision estimation (loss and PRIAL
-   against the sample, linear-shrinkage and oracle non-linear estimators).
-2. `experiment_2`: estimation of the regression vector `Sigma^{-1} v`.
-3. `experiment_3`: identification of continuous population spectra
-   `H_1` to `H_4` (Q-Q plots).
+runs covariance and precision estimation (loss and PRIAL against the sample,
+linear-shrinkage and oracle non-linear estimators), then the two robustness
+experiments below with `scale=0.05` by default. They can also be run alone:
 
 ```bash
-uv run main.py review [scale] [n_jobs]
+uv run heavy_experiments.py [scale] [n_jobs]
+uv run spike_experiments.py [scale] [n_jobs]
 ```
 
-runs instead the robustness experiments of the article (`review_experiments`):
-concentration ratio `c` near 1 and `c > 1`, singular population covariance,
-heavy tails (Student, Pareto, elliptical noise; true and retrieved spectrum),
-and spikes (outlier location and shrinkage). `scale` multiplies the numbers of
-Monte-Carlo runs (`1` reproduces the article, e.g. `0.05` for a quick check),
-`n_jobs` is the number of worker processes, and the summaries are written to
-`review_results.json`. With the default sizes the full set takes hours.
+* `heavy_experiments.py`: concentration ratio `c` near 1 and `c > 1`, singular
+  population covariance, heavy tails (Student, Pareto, elliptical noise; true
+  and retrieved spectrum). Summaries are written to `heavy_results.json`.
+* `spike_experiments.py`: location and shrinkage of the outliers created by
+  population spikes. Summaries are written to `spike_results.json`.
+
+`scale` multiplies the numbers of Monte-Carlo runs (`1` reproduces the article,
+e.g. `0.05` for a quick check) and `n_jobs` is the number of worker processes.
+With the default sizes the full sets take hours.
 
 ## Layout
 
 | File | Content |
 | --- | --- |
 | `autodiff.py` | `Autodiff`, the scikit-learn compatible estimator |
-| `utils.py` | differentiable sampler, losses and optimisation loop |
+| `utils.py` | differentiable sampler, losses, optimisation loop and sample weights |
 | `nl_formulas.py` | oracle non-linear shrinkage of covariance / precision eigenvalues |
 | `nl_utils.py` | Stieltjes transform solvers and asymptotic sample density |
 | `weighted_LWO_estimator.py` | weighted Ledoit-Wolf-type linear shrinkage |
 | `support/` | support identification (per weight family) and root finding, only used to plot the asymptotic density |
-| `main.py` | experiments |
+| `main.py` | covariance and precision estimation experiment; runs all experiments |
+| `heavy_experiments.py`, `heavy_utils.py` | heavy-tail experiments and the Monte-Carlo machinery shared with the spike experiments |
+| `spike_experiments.py`, `spike_utils.py` | spike experiments and their helpers |
 
 ## Development
 

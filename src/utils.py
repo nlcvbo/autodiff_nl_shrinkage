@@ -267,3 +267,52 @@ def autodiff_minimization(
         print("Final loss :", best_loss)
 
     return model, best_tau, np.array(running_loss), all_tau, train_lambda_, V
+
+
+def make_weight_distribution(n_atoms=200):
+    """Return the support ``d`` and probabilities ``wd`` of the weight law.
+
+    The support is uniform on ``[1, 10]``, rescaled to have unit mean.
+    """
+    d = torch.tensor(np.linspace(1, 10, n_atoms))
+    wd = torch.ones(n_atoms, dtype=torch.float64)
+    wd = wd / wd.sum(axis=0)
+    d = d / (d * wd).sum(axis=0)
+    return d, wd
+
+
+def make_weights(weights, n, alpha, d, wd):
+    """Build the vector of ``n`` sample weights.
+
+    Parameters
+    ----------
+    weights : {"ewma", "unif", "Ndiracs"}
+        ``"ewma"``: exponentially decaying weights with rate ``alpha``;
+        ``"unif"``: linear weights, ``alpha`` in ``[0, 2]``;
+        ``"Ndiracs"``: weights drawn from the discrete law ``(d, wd)``.
+    n : int
+        Number of samples.
+    alpha : float
+        Parameter of the ``"ewma"`` and ``"unif"`` families.
+    d, wd : torch.Tensor
+        Support and probabilities of the ``"Ndiracs"`` law.
+
+    Returns
+    -------
+    W : ndarray of shape (n,)
+        Sample weights, with unit mean.
+    """
+    index = np.arange(n)
+    if weights == "ewma":
+        beta = alpha / (1 - np.exp(-alpha))
+        return np.exp(-alpha * index / n) * beta
+    if weights == "unif":
+        return alpha * (index + 1 - (n + 1) / 2) / n + 1
+    if weights == "Ndiracs":
+        d, wd = d.numpy(), wd.numpy()
+        W = []
+        for j in range(1, d.shape[0]):
+            W += [d[j]] * int(n * wd[j])
+        W += [d[0]] * (n - len(W))
+        return np.array(W)
+    raise ValueError(f"Unknown weights family: {weights!r}")

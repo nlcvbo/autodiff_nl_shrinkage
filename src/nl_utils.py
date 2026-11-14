@@ -564,3 +564,18 @@ class f_xi(torch.autograd.Function):  # noqa: N801
         doutidtk = torch.concatenate([dfidtk, dFidtk, dxiidtk, domegaidtk], axis=0)
 
         return (grad_output[:, None] * doutidtk,) + (None,) * 10
+
+
+def asymptotic_density(tau, d, wd, c, mu, weights, w_args, omega, method):
+    """Compute the asymptotic sample density ``f`` and cdf ``F`` for ``tau``.
+
+    Returns
+    -------
+    xi, f, F : torch.Tensor
+        Grid, density and cdf of the asymptotic sample spectrum.
+    """
+    output = f_xi.apply(tau, None, d, wd, c, mu, weights, w_args, omega, method, False)
+    nu = output[-1].to(int)
+    output = output[: -nu - 1]
+    third = output.shape[0] // 3
+    return output[2 * third :], output[:third], output[third : 2 * third]
